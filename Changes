@@ -1,0 +1,123 @@
+Tue Jan 27 20:42:19 PST 2009  ira@h5.com
+  * 2009-01-27
+  
+  Some final cleanup before releasing to Google Code.
+  
+  - Updated INSTALL.pod to include root-based install and to note FCGI and JSON module deps
+  - removed XML::Dumper dependency
+  
+
+Mon Jan 26 18:41:12 PST 2009  ira@h5.com
+  * 2009-01-26 update
+
+Mon Jan 26 18:36:53 PST 2009  ira@h5.com
+  * 2009-01-26 install docs
+  
+  - Added greatly to INSTALL.pod, at the same time actually developing a more coherent install strategy.
+  - New utils push.pl and scan.pl
+  - got rid of some dirs users/ and admin/, in favor of worker_dotssh/ and root_dotssh/.
+  
+
+Sun Jan 25 11:55:09 PST 2009  ira@h5.com
+  * 2009-01-25 RC
+  
+  - Replaced host shuffling with consistent hashing for determining preferred order of responsibility. Host shuffling is still used for randomizing order of fragment aggregation before reduces, to spread load.
+  
+
+Fri Jan 23 17:52:35 PST 2009  ira@h5.com
+  * 2009-01-23
+  
+  Updated help system so that "robots help [topic]" prints out documentation a la darcs.
+  
+  Also removed redundant "corpora/" dir.
+  
+
+Thu Jan 22 20:23:36 PST 2009  ira@h5.com
+  * exec parallel commands
+  
+  Execute parallel commands with no input corpus but with a result corpus.
+  
+  This may be the basis for much more efficient seating and copy/append/delete of corpora.
+  
+  - no documentation yet
+  - no tests yet (bad)
+  
+  
+
+Tue Jan 13 17:29:57 PST 2009  ira@h5.com
+  * corpus repair back
+  
+  - robots repair 'corpus' works now, much smarter than before.
+  
+  
+
+Tue Jan 13 12:04:15 PST 2009  ira@h5.com
+  * lifted cluster/corpus namespace
+
+Wed Jan  7 17:02:59 PST 2009  ira@h5.com
+  * 2009-01-07
+  
+  -changed 'path' option to the more specific 'repos'. Prompted by 'context' option for execution environments.
+  
+
+Mon Dec 22 18:58:21 PST 2008  ira@h5.com
+  * 2008-12-22
+  
+  - consolidation of ct and tt executables into 'robots' executable completed
+  - added optional compression corpus attribute for easier shadow corpora support
+  - added rsync'd execution contexts in map/mapreduce separate from result corpus hierarchy
+  - added explicit sync of current dir on master as mirrored execution context
+  - removed diskfree, too specific and easy to use eg "cmd 'df -sh repos'" instead
+  
+  
+
+Sun Dec  7 11:33:54 PST 2008  ira@h5.com
+  * improved ctlist func
+  
+  - made new functionality for "list", calling "list [corpus]" lists that corpus and all shadow corpora for it.
+
+Wed Nov 19 19:06:53 PST 2008  ira@h5.com
+  * robots!
+  
+  Both ct and tt are consolidated into a single executable, "robots".
+  
+  Soon both ct.conf and tt.conf will also be consolidated (into robots.conf?)
+  
+  Pod documentation is held over from both previous programs. This will be restructured into an online help system like that of darcs.
+  
+  
+
+Sat Nov 15 16:11:22 PST 2008  ira@h5.com
+  * removed user info, other cruft
+
+Sat Nov 15 16:08:17 PST 2008  ira@h5.com
+  * removed cluster handles
+
+Sat Nov 15 16:07:09 PST 2008  ira@h5.com
+  * removed more corpus handles
+
+Sat Nov 15 15:57:42 PST 2008  ira@h5.com
+  * removal of corpus handles
+
+Sat Nov 15 15:53:08 PST 2008  ira@h5.com
+  * client logging
+  
+  - improved logging of client activity
+  - fixed bug preventing some distribution of final result files
+  
+  
+
+Fri Nov 14 18:11:58 PST 2008  ira@h5.com
+  * 2008-11-14
+  - ttstatus service upgrade - much cleaner, more efficient. API changed as well.
+  - update of status service use in tt, ttclient
+  - ct less verbose in cmd mode
+  - refactor of status service communications in tt
+  - loc significantly reduced
+  
+
+Mon Nov  3 18:07:27 PST 2008  ira@h5.com
+  * This is the RobotArmy, just renamed from TransTabulator.
+  
+  The repository contains many more files than should be released. Files to be released are listed in MANIFEST and a release may be generated using the perl Makefile.PL method.
+  

@@ -1,0 +1,51 @@
+#!/usr/bin/perl
+
+
+
+#    partition - The Robot Army default key partitioner
+#
+#    Copyright (C) 2009 H5 Technologies, Ira Woodhead
+#    
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#  
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+use strict;
+use FileHandle;
+use Digest::MD5 qw( md5 );
+use Getopt::Long;
+
+# set the input record separator
+$/ = $ENV{TTRS} if exists $ENV{TTRS};
+$/ = eval $/ if $/ =~ /^['"]/;
+
+my ($path, $sig, $R) = splice @ARGV, 0, 3;
+
+my @table;
+
+while(<>){
+  my ($key) = split /\t/;
+  next unless defined $key;
+  my $part = unpack("N", md5 $key) % ($R+1);
+
+  $table[$part] ||=
+    new FileHandle ">$path/$part/$sig" 
+      or die $!;
+
+  $table[$part]->print($_);
+}
+
+for (0..$#table){
+  $table[$_]->close if defined $table[$_];
+}
+

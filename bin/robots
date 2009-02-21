@@ -1,0 +1,1713 @@
+#!/usr/bin/perl -w
+
+#    robots - command line front end for The Robot Army 
+#
+#    Copyright (C) 2009 H5 Technologies, Ira Woodhead
+#    
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#  
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+no strict 'refs';
+use FileHandle;
+use Digest::SHA1 qw{ sha1_hex };
+use Getopt::Long;
+use LWP::UserAgent;
+use HTTP::Request;
+use Data::Dumper;
+
+our $VERSION = 0.32;
+
+my $ssh = 'ssh -q -o "ConnectTimeout 1"';
+my $scp = 'scp -q -o "ConnectTimeout 1"';
+my $rsync = 'rsync -a';
+my $PROJ = $ENV{PWD};
+die 'No RobotArmy home found. Please set $ROBOTARMY environment variable.'
+  unless exists $ENV{ROBOTARMY};
+
+chdir $ENV{ROBOTARMY} or die $!;
+
+my %OPTS = (
+  "replicate=i" => ar(0),        # f-way replication
+  "rs=s"        => ar(''),       # set the (input or output) record separator
+  "loglevel=i"  => ar(0),        # logging level, 0-?. Only print messages this priority or higher
+  "verbose"     => ar(0),        # log to the screen instead of file?
+  "uncompress"  => ar(0),        # compression is on by default
+
+  # Corpus Tool opts 
+  "repos=s"     => ar(''),       # path to the data repositories
+  "chunksize=s" => ar(''),       # uncompressed file chunk target size
+
+  # TransTabulator opts
+  "maps=i"      => ar(0),  # num of procs per machine
+  "nosort"      => ar(0),  # refrain from sorting - use for partition-only operations
+  "partition=s" => ar(''), # substitute a different partitioner
+  "crew=s"      => ar(''), # the cluster to use for execution, if not the default
+  "context=s"   => ar(''), # path to the execution contexts
+);
+
+
+%OPTS = cmdlineconf(%OPTS); # keep only explicit cmdline opts
+$OPTS{proj} = $PROJ;
+my ($command, @args) = @ARGV;
+@ARGV = ();
+
+
+my @commands = qw{ help list rollcall init copy add delete empty repair rename append cat head tail slice check cmd map mapreduce sync exec }; 
+die usage() unless $command
+            and ( grep { $command eq $_ } @commands );
+
+if( grep { $command eq $_ } qw{ map mapreduce exec }){
+  my %mr = readconf("conf/tt.conf");
+  $mr{$_} = $OPTS{$_} for keys %OPTS;
+  $mr{proj} = $PROJ;
+  $mr{cmd} = $command;
+  tt(\%mr, @args); # tt does not use %OPTS
+} else {
+  $args[0] = corpus($args[0]) 
+    if @args # predetermine specifics of a corpus
+    and not grep { $command eq $_ } qw{ help sync cmd rollcall }; # except for these
+  $command = "ct$command";
+  $command = \&$command;
+  $command->(@args);
+}
+exit 0;
+
+
+
+
+
+# create a new empty corpus
+sub ctinit {
+  my $conf = shift;
+  die "Corpus exists with that name.\n" if corpusexists($conf);
+  $conf->{$_} = $OPTS{$_} for keys %OPTS; # override with any commandline opts
+  $conf->{replicate} = @{$conf->{hosts}} if $conf->{replicate} > @{$conf->{hosts}}; # sanity
+  $conf->{nodename} = sprintf("%X", int rand(2**32)) . sprintf("%X", int rand(2**32));
+  writecorpus($conf);
+  print "Created ", $conf->{cluster}, "/", $conf->{name}, "\n";
+}
+
+
+# construct a corpus type
+sub corpus {
+  my $corpus = shift;
+  my ($cluster, $name) = cluster_and_corpus($corpus);
+  my %conf;
+  if( -e "clusters/$cluster/$name" ){
+    %conf = readconf("clusters/$cluster/$name");
+  } else {
+	%conf = readconf('conf/ct.conf');
+  }
+  $conf{hosts} = readlist("clusters/$cluster/.hosts");
+  $conf{files} = readlist("clusters/$cluster/$name.files");
+  $conf{name}    = $name;
+  $conf{cluster} = $cluster;
+  return \%conf;
+}
+
+sub writecorpus {
+  my %orig = %{ $_[0] };
+  my %conf = %orig; # make a copy so we don't harm the original
+  $conf{files} = [] unless exists $conf{files};
+  writelist("clusters/$conf{cluster}/$conf{name}.files", $conf{files});
+  delete $conf{files};
+  delete $conf{hosts};
+  writeconf(\%conf, "clusters/$conf{cluster}/$conf{name}");
+}
+
+
+# nail down which cluster and corpus name
+sub cluster_and_corpus {
+  my $corp = shift;
+  die "No corpus specified" unless $corp;
+  my @spec = split /\//, $corp;
+  die "cluster/corpus is malspecified: $corp" if @spec > 2;
+  if(@spec == 2){
+    die "No such cluster $spec[0]" unless -d "clusters/$spec[0]";
+    return @spec;
+  }
+  my %conf = readconf('conf/ct.conf'); 
+  return ($conf{cluster}, $corp) if -e "clusters/$conf{cluster}/$corp";
+  my @candidates = glob("clusters/*/$corp");
+  return ($conf{cluster}, $corp) if @candidates == 0; # non-existent
+  die "$corp exists in multiple non-default clusters" if @candidates > 1;
+  $candidates[0] =~ s|^clusters/||;
+  return (split m|/|, $candidates[0]);
+}
+
+sub corpusexists {
+  my %conf = %{ $_[0] };
+  return 1 if -e "clusters/$conf{cluster}/$conf{name}";
+  return 0;
+}
+
+# delete the handle without touching the data. For that use ctdelete
+sub unlinkcorpus {
+  my %conf = %{ $_[0] };
+  unlink "clusters/$conf{cluster}/$conf{name}";
+  unlink "clusters/$conf{cluster}/$conf{name}.files";
+}
+
+# add - add to a corpus from file(s), a dir, or a stream of data.
+#
+#  - splits the input into sizes of not less than the target chunksize
+#  - names the chunks according to a content signature
+#  - distributes the chunks to the responsible hosts
+#  - writes/updates the corpus handle file list [corpus].files
+
+sub ctadd {
+  my ($conf, @files) = @_;
+  my %conf = %$conf;
+  die "Cannot add to shadow corpus" if $conf{name} =~ /\]$/;
+  die "Corpus not found." unless corpusexists($conf);
+  my $corpsig = sha1_hex($conf{name}); # get a symbol to use locally
+  my $sha = new Digest::SHA1;
+  my $RS = $conf{rs}; 
+  $RS = eval $RS if ($RS =~ /^["']/);
+  my ($bytes, $records);
+
+  my $startchunk = sub {
+    my $compress = (exists $conf{uncompress} ? '' : '|gzip');
+    open FD, "$compress>$corpsig-out";
+    $bytes = 0;
+    $records = 0;
+  };
+
+  my $endchunk = sub {
+    close FD;
+    $sha->addfile(new FileHandle "<$corpsig-out");
+    my $chunksig = $sha->hexdigest . ".$records.$bytes";
+    rename "$corpsig-out", $chunksig;
+    if( $bytes > 0 ){
+      push @{$conf{files}}, $chunksig;
+      writecorpus(\%conf);
+      async( 1, 
+        sub {
+          distribute( $chunksig, "$conf{repos}/$conf{nodename}/", $conf{replicate}, $conf{hosts} );
+          unlink $chunksig;
+        }
+      );
+    } else { 
+      unlink $chunksig; 
+    }
+  };
+
+  my $addfile = sub {
+    my $file = shift;
+    my $size = -s $file;
+    return unless $size;
+    open(IN, "<$file");
+    while(<IN>){
+      print FD $_;
+      $bytes += length $_;
+    }
+    close IN;
+    $records++;
+    print FD $RS; # $RS for output, $/ for input
+    $bytes += length $RS;
+    if($bytes >= $conf{chunksize}){
+      $endchunk->();
+      $startchunk->();
+    }
+  };
+
+  my $addstream = sub {
+    local $/ = $RS;
+    while(<>){
+      next unless $_;
+      $bytes += length $_;
+      print FD $_;
+      $records++;
+      if($bytes >= $conf{chunksize}){
+        $endchunk->();
+        $startchunk->();
+      }
+    }
+  };
+
+
+  $startchunk->();
+  if(@files){
+    descend( $addfile, @files );
+  } else {
+    $addstream->();
+  }
+  $endchunk->();
+  writecorpus(\%conf);
+  
+  cleanupkids();
+}
+
+
+
+
+# List all available clusters, corpora
+sub ctlist {
+  my @corpora;
+  if(my ($single) = @_){
+    my %single = %$single;
+    @corpora = glob("clusters/*/$single{name}");
+    return unless @corpora;
+    push @corpora, grep { !/\.files$/ } glob("clusters/*/$single{name}\[*");
+  } else {
+    @corpora = grep { !/\]$/ } grep { !/\.files$/ } glob('clusters/*/*');
+    listclusters();
+  }
+  s|^clusters/|| for @corpora;
+  my @headers = qw{ cluster corpus zip records bytes chunks rs };
+  my @entries = ();
+  for my $path (@corpora){
+    my ($cluster, $corpus) = split m|/|, $path;
+    my $conf = corpus("$cluster/$corpus");
+    my ($chunks, $records, $bytes) = chunkmeta(%$conf);
+    push @entries, [ $cluster, $corpus, (exists $conf->{uncompress}?'':'*'), 
+	                 $records, $bytes, $chunks, $conf->{rs} ];
+  }
+  print "\n", scalar @corpora, " corpora:\n";
+  print formatlist(\@headers, \@entries), "\n";
+}
+
+sub listclusters {
+  my @clusters = glob('clusters/*');
+  s|^clusters/|| for @clusters;
+  my @headers = qw{ name hosts };
+  my @entries;
+  for my $cluster (@clusters){
+    my $hosts = readlist("clusters/$cluster/.hosts");
+    push @entries, [ $cluster, scalar @$hosts ];
+  }
+  print scalar @clusters, " clusters:\n";
+  print formatlist(\@headers, \@entries), "\n";
+}
+
+sub formatlist {
+  my($headers, $entries) = @_;
+  my @lengths = @$headers;
+  for my $entry (@$entries){
+    @lengths = 
+      map { (length $entry->[$_] > length $lengths[$_]) ? $entry->[$_] : $lengths[$_] } 
+      (0..$#lengths); 
+  }
+  my $template = join ' ', map { 'A' . (1 + length $_) } @lengths;
+
+  my $result = '';
+  $result .= pack($template, @$headers) . "\n";
+  $result .= pack($template, map { '-' x (length $_) } @lengths) . "\n";
+  for my $entry (@$entries){
+    $entry = pack($template, @$entry);
+  }
+  $result .= join( "\n", sort @$entries );
+}
+
+sub chunkmeta {
+  my %conf = @_;
+  return (0,0,0) unless corpusexists(\%conf);
+  my ($chunks, $records, $bytes) = (scalar @{$conf{files}},0,0);
+  for ( @{$conf{files}} ){
+    if(m|^[\da-f]{40}\.(\d+)\.(\d+)$|){
+      $records += $1;
+      $bytes   += $2;
+    }
+  }
+  return ($chunks, $records, $bytes);
+}
+
+
+
+sub ctrollcall {
+  die "No known_hosts file in \$ROBOTARMY/worker_dotssh\n" unless -e 'worker_dotssh/known_hosts';
+
+  system "sort worker_dotssh/known_hosts -o /tmp/known_hosts.srt";
+  system "cut -f1 -d' ' /tmp/known_hosts.srt | ssh-keyscan -t rsa -f - > /tmp/keyscanned_hosts 2>/dev/null";
+  my @changed = `sort /tmp/known_hosts.srt /tmp/keyscanned_hosts | uniq -u | cut -f1 -d' ' | uniq -d`;
+  if(@changed){
+    print "WARNING! HOST KEYS HAVE CHANGED.\n";
+    print "Reconcile the following diffs in $ENV{ROBOTARMY}/worker_dotssh/known_hosts and rerun 'robots rollcall'\n";
+    print join '', @changed;
+    unlink "/tmp/known_hosts.srt", "/tmp/keyscanned_hosts";
+    return;
+  }
+  my @missing = `sort /tmp/known_hosts.srt /tmp/keyscanned_hosts | uniq -u | cut -f1 -d' ' | uniq -u`;
+  if(@missing){
+    print "\nThe following hosts are missing:\n";
+    print join '', @missing;
+    unlink "/tmp/known_hosts.srt", "/tmp/keyscanned_hosts";
+    return;
+  }
+}
+
+
+
+# Takes an offset and runlength, outputs those records from the given corpus
+sub ctslice {
+  my ($conf, $offset, $runlen) = @_;
+  my %conf = %$conf;
+  my (undef, $records) = chunkmeta(%conf);
+  die "Record count overflow. $records records in corpus" if
+    ($records < $offset+$runlen);
+
+  $SIG{INT} = sub { exit };
+  
+  my %locations = ();
+  for my $host ( @{$conf{hosts}} ){
+    my $hosted = inventory_host($host, "$conf{repos}/$conf{nodename}");
+    for my $chunk (@$hosted){
+      $chunk =~ s|^.*/([^/]+)$|$1|;
+      push @{ $locations{$chunk} }, $host;
+    }
+  }
+  my $inclusive = 0;
+  my @chunks = 
+    map  { $_->[2] }
+    grep { $_->[1] < $offset+$runlen }
+    grep { $_->[0] >= $offset }
+    map { my($r) = (m|^[\da-f]{1,40}\.(\d+)\.\d+$|); 
+          $inclusive += $r; 
+          [ $inclusive, $inclusive-$r, $_ ]; 
+        } 
+    @{$conf{files}};
+
+  my @missing = grep { !exists $locations{$_} } @chunks;
+  print STDERR "Corpus is currently incomplete. These files are missing:\n", 
+               join("\n", @missing), "\n" 
+               if @missing;
+
+  my $uncompress = (exists $conf{uncompress} ? '' : '| gunzip -c');
+  for my $chunk (@chunks){
+    my $retval = 0;
+    for my $host ( @{$locations{$chunk}} ){
+      $retval = system "$ssh $host 'cat $conf{repos}/$conf{nodename}/$chunk' $uncompress";
+      last unless $retval;
+    }
+  print STDERR "Error (", ($retval>>8), ") in retrieval of file $chunk\n" if $retval;
+  }
+}
+
+sub ctcat {
+  my ($conf) = @_;
+  my (undef, $records, undef) = chunkmeta(%$conf);
+  ctslice($conf, 0, $records);
+}
+
+sub cthead {
+  my ($conf, $count) = @_;
+  $count ||= 1;
+  ctslice($conf, 0, $count);
+}
+
+sub cttail {
+  my ($conf, $count) = @_;
+  $count ||= 1;
+  my (undef, $records, undef) = chunkmeta(%$conf);
+  ctslice($conf, $records-$count, $count);
+}
+
+
+# delete a corpus or list of corpora
+sub ctdelete {
+  my($conf, @rest) = @_;
+  unshift @rest, $conf->{cluster} . '/' . $conf->{name};
+  for my $corp (@rest){
+    my %conf = %{ corpus($corp) };
+    next unless corpusexists(\%conf);
+    ctcmd($conf{cluster}, "rm -r $conf{repos}/$conf{nodename}") # DO NOT delete data files
+      unless $conf{name} =~ /\]$/;                              # if this is a shadow corp
+    # delete any shadows
+	my $name = "clusters/$conf{cluster}/$conf{name}";
+    for ( '', qw([in] [err] [log]) ){
+      unlink "$name$_" if -e "$name$_";
+	  unlink "$name$_.files" if -e "$name$_.files";
+    }	
+  }
+}
+
+
+
+
+# empty out a corpus, keeping its settings intact while getting rid of data
+sub ctempty {
+  my %conf = %{ $_[0] };
+  die "Operation not allowed on shadow input corpus" if $conf{name} =~ /\[in\]$/;
+  ctdelete(\%conf);
+  $conf{files} = [];
+  %OPTS = %conf;
+  ctinit(\%conf);
+}
+
+
+sub ctcheck {
+  my %conf = %{ $_[0] };
+  die "Corpus $conf{name} not found" unless corpusexists(\%conf);
+  my @shadow = map { m|^corpora/$conf{cluster}/(.+)$|; } 
+               grep { !/\.files$/ } 
+			   glob("clusters/$conf{cluster}/$conf{name}\[*");
+  @shadow = ('none') unless @shadow;
+  
+  my $inv = inventory(\%conf);
+  my @counts;
+  $counts[scalar @$_]++ for map { $inv->{$_} } keys %$inv;
+
+  print "Corpus check for $conf{cluster}/$conf{name} :\n\n";
+  print join('', map { "    $_ = $conf{$_}\n" } keys %conf);
+  print "\nShadow corpora: ", join(", ", @shadow);
+  print "\n\n";
+  if($counts[0]){
+    print "  Files missing from the corpus: $counts[0]\n";
+    print "  * * * no repair currently possible * * *\n";
+    print "  Try putting any offline machines back on and rerun corpus check.\n\n";
+  }
+  print pack("A25 A*", "replicants", "file count"), "\n";
+  print pack("A25 A*", "----------", "----------"), "\n";
+  for my $i (0..$#counts){
+    next unless $counts[$i];
+    print pack("A25 A*", $i, $counts[$i]), "\n";
+  }
+  print "-------------------------------------\n";
+  print "total chunks: ", scalar @{$conf{files}}, "\n";
+  print "replication factor: $conf{replicate}\n";
+}
+
+sub ctrepair {
+  my %conf = %{ $_[0] };
+  my $files = inventory(\%conf);
+  my %files = 
+    map { $_ => $files->{$_} } 
+    grep { @{$files->{$_}} < $conf{replicate} } 
+    keys %$files;
+  my $failed = movedata(\%conf, \%files, \%conf);
+  warn "Repair failed, the following files did not replicate\n",
+    join("\n", @$failed)
+    if ref $failed;
+}
+
+# copy a corpus to a new corpus, using any different settings specified (eg different cluster).
+sub ctcopy {
+  my ($old, $newcorp) = @_;
+  my %old = %$old;
+  my %new = %old;
+  ($new{cluster}, $new{name}) = cluster_and_corpus($newcorp);
+  $new{files} = [];
+  die "Destination corpus $new{cluster}/$new{name} already exists.\n"
+    if corpusexists(\%new);
+
+  ctinit(\%new);
+  my $failed = ctappend(\%old, $newcorp);
+  if(ref $failed){
+    ctdelete(\%new);
+    die join("\n", @$failed), 
+      "\nAppend failed. The above files are missing from source corpus.\n";
+  }
+}
+
+# takes source corpus, inventory, destination corpus handle
+sub movedata {
+  my ($old, $files, $new) = @_;
+  my %old = %$old;
+  my %new = %$new;
+
+  # make sure we're landed -- should be taken care of somewhere else?
+  system "$ssh $_ 'mkdir -p $new{repos}/$new{nodename}'" for @{$new{hosts}};
+
+  my @failed;
+  my $filecount;
+  for my $file (keys %$files){
+    $filecount++;
+    my @hosts = @{ $files->{$file} };
+    my $preflist = consistenthashring( $file, $new{hosts} );
+    my $attempts = 0;
+    my $replicants = 0;
+    for my $source (@hosts){
+      for my $target ( @$preflist ){
+        $attempts++;
+        my $ret = 
+          system "$ssh $source '$rsync $old{repos}/$old{nodename}/$file $target:$new{repos}/$new{nodename}/$file 2>/dev/null'";
+        $replicants++ unless $ret;
+        print STDERR "$file $filecount: $replicants replicants, $attempts attempts.\r";
+        last if $replicants >= $new{replicate};
+      }
+      last if $replicants >= $new{replicate};
+    }
+    push @failed, $file unless $replicants;
+  }
+  return \@failed if @failed;  
+  return scalar keys %$files;
+}
+
+# add one corpus's data into another corpus.
+sub ctappend {
+  my ($old, $newcorp) = @_;
+  my %new = %{ corpus($newcorp) };
+  my %old = %$old;
+  die "Cannot append to shadow corpus" if ($old{name} =~ /\]$/) or ($new{name} =~ /\]$/);
+  die "No corpus handle found for $newcorp\n" unless corpusexists(\%new);
+  die "No data to copy!\n" unless @{$old{files}};
+
+  my $files = inventory(\%old);
+  my $failed = movedata(\%old, $files, \%new);
+  if( ref $failed ){
+    warn "Move failed, corpus not updated\n";
+    return $failed;
+  }
+  push @{ $new{files} }, @{ $old{files} };
+  writecorpus(\%new);
+  return 0;
+}
+
+
+sub ctrename {
+  my ($conf, $newname) = @_;
+  my %conf = %$conf;
+  die "Corpus $conf{name} not found" unless corpusexists($conf);
+  die "Usage: cluster/oldname newname" if $newname =~ m|/|;
+  rename "clusters/$conf{cluster}/$conf{name}",       "clusters/$conf{cluster}/$newname";
+  rename "clusters/$conf{cluster}/$conf{name}.files", "clusters/$conf{cluster}/$newname.files";
+}
+
+# mirror the EXECUTION CONTEXT to all monkeys
+sub ctsync {
+  my($cluster) = @_;
+  my %conf = readconf("conf/ct.conf");
+  my $hosts = readlist("clusters/$cluster/.hosts");
+  for my $host (@$hosts){
+    my $retval = system "$ssh $host 'mkdir -p $conf{context}/$OPTS{proj}'";
+    print STDERR "connect to $host failed (", ($retval>>8), ")\n" if $retval;
+    next if $retval;
+    $retval = system "$rsync $OPTS{proj}/ $host:$conf{context}/$OPTS{proj}";
+    print STDERR "rsync to $host failed (", ($retval>>8), ")\n" if $retval;
+  }
+}
+
+
+# Issue a command on each host in turn, sequentially.
+sub ctcmd {
+  my ($cluster, $cmd) = @_;
+  die "No such cluster $cluster" unless -e "clusters/$cluster/.hosts";
+  my $hosts = readlist("clusters/$cluster/.hosts");
+
+  my $poolcmd = 
+    sub {
+      my($k) = @_;
+      my $thishost = $hosts->[$k];
+      my $start = time;
+      print "$thishost: \n" if exists $OPTS{verbose};
+      execute_code_serial( sub { system "$ssh $thishost \'$cmd\'" } );
+    };
+
+  my $N = scalar @$hosts;
+  map { $poolcmd->($_) } (0..$N-1);
+}
+
+
+# Supporting functions
+
+# Recursively execute $code on each regular file found in 
+# the list of files/directories
+sub descend {
+  my ($code, @files) = @_;
+  
+  return unless @files;
+  while(@files){
+    my $this = shift @files;
+
+    if( -f $this ){
+      $code->($this);
+    }
+    elsif( -d $this ){
+      descend($code, glob("$this/*"));
+    }
+  }
+}
+
+
+# distributing files
+# 
+# Responsibility is determined by creating a consistent hash ring of hosts and 
+# placing the content signature of the file on the ring, making the first 
+# [replication factor] healthy hosts responsible.
+sub distribute {
+  my ( $source, $destpath, $fway, $hosts ) = @_;
+  my $preflist = consistenthashring( $source, $hosts );
+
+  my $successes = 0;
+  for my $host (@$preflist){
+    system "$ssh $host 'mkdir -p $destpath'";
+    my $ret = system "$scp $source $host:$destpath";
+    if( $ret ){
+      warn "$host file transfer error (code ".($ret>>8).")\n";
+      next;
+    }
+    print STDERR "$source $successes replicants.\r";
+    last if ++$successes >= $fway;
+  }
+
+  warn "WARNING: Could only replicate to $successes (not $fway) hosts.\n" 
+    if $successes < $fway;
+}
+
+
+# Spawn a new process for a closure and hand back child pid.
+{
+  my %children = ();
+
+  sub async {
+    my $allowed = shift;
+    my $cmd     = shift;
+    my $pid;
+    if ( $allowed <= keys %children ) {
+      $pid = wait;
+      delete $children{$pid};
+    }
+    if ( $pid = fork ) {
+      $children{$pid} = 1;
+      return $pid;
+    }
+
+    open(STDIN, "</dev/null");
+    exit $cmd->(@_);    # return status code of cmd, on exit, in $?
+  }
+
+  sub cleanupkids {
+    while ( keys %children ) {
+      my $pid = wait;
+      delete $children{ $pid };
+    }
+  }
+}
+
+
+# Serial version of async(). 
+# Hands back result of code execuion, if any
+sub execute_code_serial {
+  my $cmd = shift;
+  return $cmd->(@_);
+}
+
+
+sub inventory {
+  my %conf = %{ $_[0] };
+  my %files = map { $_ => [] } @{$conf{files}};
+  for my $host ( @{$conf{hosts}} ){
+    my $hfiles = inventory_host($host, "$conf{repos}/$conf{nodename}");
+    for(@$hfiles){
+      next unless exists $files{$_};
+      push @{ $files{$_} }, $host;
+    }
+  }
+  return \%files;
+}
+
+sub inventory_host {
+  my ($host, $path) = @_;
+  my @files;
+  open LS, "$ssh $host ls $path 2>/dev/null | cat |";
+  while(<LS>){
+    chomp;
+    next unless /^[0-9a-f]{1,40}\.\d+\.\d+$/; # sig.records.bytes
+    push @files, $_;
+  }
+  close LS;
+  return \@files;
+}
+
+
+
+
+
+# MAP/MAPREDUCE distributed processing section
+sub tt {
+  my($mr, @args) = @_;
+  my %mr = %$mr;
+  ttexec($mr, @args) && return if $mr{cmd} eq 'exec';
+  my($source, $target, @extra);
+  if($mr{cmd} eq 'map'){       ($source, $mr{mapcmd},                 $target, @extra) = @args; }
+  if($mr{cmd} eq 'mapreduce'){ ($source, $mr{mapcmd}, $mr{reducecmd}, $target, @extra) = @args; }
+  die usage() if @extra;
+  die usage() unless defined $target;
+  die "Source corpus does not exist!" unless corpusexists( corpus($source) );
+
+  # source is an existing handle, target is created from default config with this cluster
+  my %source = %{ corpus($source) };
+  my %target = %{ corpus($target) };
+  $target{rs} = $mr{rs} if exists $mr{rs};
+  ctinit(\%target) unless corpusexists(\%target);
+  $mr{source}  = "$source{cluster}/$source{name}";
+  $mr{target}  = "$target{cluster}/$target{name}";
+  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
+  $mr{cluster} = $source{cluster};
+  $mr{crew}    = $source{cluster} unless exists $mr{crew};
+  $mr{statusport} = (int rand 9000) + 1999;
+
+  create_sandbox(\%mr);
+  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
+  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target{name}.log"), $mr{loglevel});
+  my $log = logger($mr{cmd});
+
+  # start server
+  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
+    my($exit, $sig) = ($err >> 8, $err & 127);
+    $log->(0, "status service failed to start: exit code $exit, sig $sig. Exiting.\n");
+    die "status server failed to start: exit code $exit, sig $sig\n";
+  }
+
+  # clean up on INT or DIE
+  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
+  
+  die "Could not register sources" 
+    unless register(source => $source{hosts} )->is_success;
+  $log->(0, "registered " . scalar @{$source{hosts}} . " sources in cluster $source{cluster}\n");
+  
+  die "Could not register source files " 
+    unless register(in => $source{files} )->is_success;
+  $log->(0, "registered " . scalar @{$source{files}} . " files in corpus $source\n");
+
+  my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
+  die "No hosts in crew $mr{crew}" unless @crew;
+  $log->(0, "executing job spec: " . Dumper \%mr);
+
+  monitor(\%mr);
+  
+  kill TERM => `cat $mr{sandbox}/httpd.pid`;
+}
+
+sub ttexec {
+  my($mr, @args) = @_;
+  my %mr = %$mr;
+  my($target, @extra);
+  ($mr{mapcmd}, $target, @extra) = @args;
+  die usage() if @extra;
+  die usage() unless defined $target;
+
+  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target.log"), $mr{loglevel});
+  my $log = logger($mr{cmd});
+
+  # target is created from default config
+  my %target = %{ corpus($target) };
+  ctinit(\%target) unless corpusexists(\%target);
+  $mr{target}  = "$target{cluster}/$target{name}";
+  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
+  $mr{cluster} = $target{cluster};
+  $mr{crew}    = $target{cluster} unless exists $mr{crew};
+  $mr{statusport} = (int rand 9000) + 1999;
+
+  create_sandbox(\%mr);
+  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
+  
+  # start server
+  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
+    my($exit, $sig) = ($err >> 8, $err & 127);
+    $log->(0, "status service failed to start: exit code $exit, sig $sig. Exiting.\n");
+    die "status server failed to start: exit code $exit, sig $sig\n";
+  }
+
+  # clean up on INT or DIE
+  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
+
+  die "Could not register hosts" 
+    unless register(source => $target{hosts} )->is_success;
+  $log->(0, "registered " . scalar @{$target{hosts}} . " hosts in cluster $target{cluster}\n");
+  
+  execmonitor(\%mr);
+  
+  kill TERM => `cat $mr{sandbox}/httpd.pid`;
+}
+
+
+
+
+# create the local and remote configuration environments
+sub create_sandbox {
+  my( $mr ) = @_;
+  my %mr = %$mr;
+
+  system "rm -rf $mr{sandbox}";
+  system "mkdir -p $mr{sandbox}";
+
+  my $client = "$mr{sandbox}/client";
+  system "cp -r client $client";
+  system "cp -r clusters/*           $client/clusters/."; # a bit brutish
+  system "cp -r conf                 $client/conf";
+  system "cp $mr{partition}          $client/bin/." if exists $mr{partition};
+  system "cp client/bin/*            $client/bin/.";
+  writeconf(\%mr, "$client/conf/task.conf");
+
+  system "cp -r status/* $mr{sandbox}/.";
+
+  # create a custom httpd configuration for this execution
+  open HTTPDCONF, ">>$mr{sandbox}/httpd.conf";
+  print HTTPDCONF <<EOF
+server.modules = ( "mod_access", "mod_status", "mod_fastcgi", "mod_accesslog" )
+server.document-root = "$mr{sandbox}"
+
+fastcgi.server = (
+         "/ttstatus" => 
+            ((
+                "socket"       => "$mr{sandbox}/ttstatus.socket",
+                "check-local"  => "disable",
+                "bin-path"     => "$mr{sandbox}/bin/ttstatus",
+                "min-procs"    => 1,
+                "max-procs"    => 1,
+                "max-load-per-proc" => 1,
+                "idle-timeout" => 10,
+            )),
+    )
+status.status-url  = "/server-status"
+status.config-url  = "/server-config"
+accesslog.filename = "$mr{sandbox}/access.log"
+server.errorlog    = "$mr{sandbox}/error.log"
+server.pid-file    = "$mr{sandbox}/httpd.pid"
+server.port        = $mr{statusport}
+EOF
+;
+  close HTTPDCONF;
+}
+
+
+
+
+
+
+# MONITOR - whittle down a list of tasks, comprising:
+# - keep an eye on the locked/unlocked chunks (and partitions if mapreduce), 
+#   giving a little jab if it looks like something has fallen through the cracks,
+# - record any results into the output corpus
+# - maintain the still-to-be-processed input chunks in a subcorpus (and the partitions
+#   in a special partition corpus if mapreduce)
+sub monitor {
+  my $mr = shift;
+  my %mr = %$mr;
+  $0 = "robot army $mr{cmd} monitor";
+  my $log = logger("$mr{cmd} monitor");
+  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
+
+  my @kickdata = ( kicker('in',     $mr{statusport},  5*60) );
+  push @kickdata,  kicker('part',   $mr{statusport}, 20*60) if exists $mr{reducecmd};
+
+  my @funcs = ();
+  push @funcs, inventorying($mr);
+  push @funcs, installerlauncher($mr);
+  push @funcs, kicker('source', $mr{statusport}, 5*60);
+  push @funcs, chopper(@kickdata);
+  push @funcs, input_checkpointer($mr{source}, $mr{target}, $mr{statusport});
+  push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
+
+  my $recordout = 
+    output_recorder($mr{target}, (exists $mr{reducecmd} ? 'part' : 'in'), $mr{statusport});
+  monitorloop($log, $recordout, @funcs);
+}
+
+sub execmonitor {
+  my $mr = shift;
+  my %mr = %$mr;
+  $0 = "robot army $mr{cmd} monitor";
+  my $log = logger("$mr{cmd} monitor");
+  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
+
+  my @funcs = ();
+  push @funcs, installerlauncher($mr);
+  push @funcs, stderr_recorder($mr{crew}, $mr{target}, $mr{statusport});
+
+  my $recordout = output_recorder($mr{target}, 'source', $mr{statusport});
+  monitorloop($log, $recordout, @funcs);
+}
+
+sub monitorloop {
+  my ($log, $final, @funcs) = @_;
+  while( 1 ){
+    @funcs = grep { $_->() } @funcs;
+    last unless $final->();  # this is what really says when we're ready to wrap up
+    $log->(0, "sleeping 5\n");
+    sleep 5;
+  }
+  $_->() for @funcs; # one last time then we're done
+}
+
+sub clientlogshadow {
+  my ($crew, $target, $maps) = @_;
+  my %conf = %{ corpus($target) };
+  my @crew = @{ readlist("clusters/$crew/.hosts") };
+  $conf{rs} = '"\n"';
+  $conf{nodename} .= '/client/log';
+  $conf{cluster} = $crew;
+  $conf{uncompress} = 1;
+  $conf{name} .= '[log]';
+  writecorpus(\%conf);
+  open CLOG, ">clusters/$conf{cluster}/$conf{name}.files" or die $!;
+  for my $machine (0..$#crew){
+    printf CLOG "%020x%020x.1.0\n", $machine, $_ for 1..$maps;
+  }
+  close CLOG;
+}
+
+sub inventorying {
+  my($conf) = @_;
+  my %conf = %$conf;
+  my $log = logger('inventory');
+  my %source = %{ corpus($conf{source}) };
+
+  return sub {
+    my ($free, $locked) = object_count('source');
+    return 0 unless $free or $locked; # all accounted for
+    return 1 unless $free;
+    my @free = object_count('source', 0); # 0 means 'FREE'
+    while(@free){
+      my $hostobj = shift @free;
+      my $host = $hostobj->[0];
+      $log->(0, "locking $host for registration.\n");
+      statshift('lock' => source => $host );
+      my @files = grep { m/[a-f\d]{40}\.\d+\.\d+\n$/ } 
+                  `$ssh $host 'ls $source{repos}/$source{nodename} 2>/dev/null | cat'`;
+      unless( @files ){
+        statshift(free => source => $host );
+        $log->(0, "$host had no files... keeping an eye on it.\n");
+        next;
+      }
+      chomp @files;
+      $log->(0, "registering " . scalar @files . " files from $host\n");
+      register(in => \@files, source => $host);
+    }
+	return 1;
+  };
+}
+
+
+# install the environment and launch commands once per monkey. Keep checking
+# if any are unavailable at first.
+sub installerlauncher {
+  my($conf)  = @_;
+  my %conf   = %$conf;
+  my $log    = logger('installer-launcher');
+  my %trg    = %{ corpus($conf{target}) };
+  my @crew   = @{ readlist("clusters/$conf{crew}/.hosts") };
+  my %crew = map { $crew[$_] => $_ } 0..$#crew;
+
+  return sub {
+    for my $host (@crew){
+      my $ret = system 
+        "$ssh $host 'rm -rf $trg{repos}/$trg{nodename}/client; mkdir -p $trg{repos}/$trg{nodename}; mkdir -p $conf{context}/$conf{proj}'";
+      $log->(0, "$host unresponsive, ssh returned " .($ret>>8). " - did not install.\n") && next if $ret;
+      
+	  $ret = system 
+        "$scp -r $conf{sandbox}/client $host\:$trg{repos}/$trg{nodename}/client";
+      $log->(0, "installed on $host with exit code " . ($ret>>8) . ".\n");
+    
+      $ret = system
+        "$rsync $conf{proj}/ $host\:$conf{context}/$conf{proj}";
+      $log->(0, "mirrored exec context on $host with exit code " . ($ret>>8) . ".\n");
+    }
+
+	for my $host (@crew){
+      my $i = $crew{$host};
+      my $cmds = join ';', map {"perl bin/ttclient $i $_"} 1..$conf{maps};
+      my $ret = system "$ssh $host \'cd $trg{repos}/$trg{nodename}/client;$cmds\'";
+      $log->(0, "launched on $host with exit code " . ($ret>>8) . ".\n");
+      delete $crew{$host} unless $ret; # remove from future consideration if successful
+    }
+    return 0 unless %crew; # everybody finished?
+    @crew = keys %crew;
+	return 1;
+  };
+}
+
+# KICKER - produces a code ref that monitors objects of a certain type, 
+# finishing only when all have been retired. Unlocks any locked ones 
+# hanging around for more than $time seconds
+sub kicker {
+  my ($type, $port, $time) = @_;
+  my $log = logger("$type kicker");
+  my $start = time;
+  my ($free, $lokd, $rtrd, $oops) = (0,0,0,0);
+
+  my $rate = sub {
+    return sprintf "%.2f/sec", $rtrd / (time - $start);
+  };
+
+  # monitor the locked / unlocked input chunks while there are any
+  my %times;
+  return sub {
+    ($free, $lokd, $rtrd, $oops) = object_count($type);
+    my $r = $rate->();
+    print STDERR "'$type' [remaining: $free], [processing: $lokd], [done: $rtrd], [reversions: $oops], [rate: $r]\r";
+
+    $log->(0, "found [free $free, lokd $lokd, rtrd $rtrd, oops $oops]\n");
+    if( $free ){ # wait until the end to track durations
+      $log->(0, "returning, there are free objs\n");
+	  return 1;		
+	}
+    unless( $lokd ){ # finish up when all objects have been retired
+      $log->(0, "exiting, zero lokd objs\n");
+      return 0;	
+	}
+    my $now = time;
+    my @lokd = object_count($type, 1); # 1 is 'LOKD'
+    my %latest = map { $_ => $now } @lokd;
+    for my $stillhere (grep { exists $latest{$_} } keys %times){
+      $latest{$stillhere} = $times{$stillhere};
+    }
+    %times = %latest;
+
+	# unlock any locked objects hanging around more than $time secs past the last free file
+    my @stillhere = grep {($now - $times{$_}) > $time } keys %times;
+    for my $stillhere (@stillhere){ 
+      $log->(1, "freeing $stillhere (lokd too long, tardy monkey)\n");
+      $times{$stillhere} = $now;
+      statshift(free => $type => $stillhere );
+    }
+  };
+}
+
+
+# record the results as they appear. Quit when source data type is all retired.
+sub output_recorder {
+  my ($target, $sourcetype, $port) = @_;
+  my %target = %{ corpus($target) };
+  my $log = logger('output recorder');
+
+  return sub {
+    my($srcfree,$srclokd,$srcrtrd,$srcoops) = object_count($sourcetype);
+
+    my ($free, $lokd) = object_count('out');
+    $log->(0, "found $sourcetype:[$srcfree,$srclokd,$srcrtrd,$srcoops]\n") if defined $srcfree;
+    return 1 unless (defined $free) and $free;
+    $log->(0, "found out:[$free,$lokd] in $target{name}\n");
+    my @free = object_count('out', 0); # 0 == FREE
+    open RESULT, ">>clusters/$target{cluster}/$target{name}.files" or die $!;
+    for (@free){
+      my $chunk = $_->[0];
+      next if 
+        statshift('lock' => 'out' => $chunk)->is_error;
+   	  print RESULT "$chunk\n";
+    }
+    close RESULT;
+
+    unless ( $srcfree or $srclokd ){ # finish up if source data is all retired
+      $log->(0, "exiting, job complete (zero [$sourcetype] objects free or lokd left)\n");
+      return 0;
+    }
+  };
+}
+
+sub stderr_recorder {
+  my ($crew, $target, $port) = @_;
+  my $log = logger('stderr recorder');
+  my %conf = %{ corpus($target) };
+  $conf{rs} = '"\n"';
+  $conf{nodename} .= '/client/err';
+  $conf{cluster} = $crew;
+  $conf{uncompress} = 1;
+  $conf{name} .= '[err]';
+  writecorpus(\%conf);
+
+  return sub {
+    my ($free) = object_count('err');
+    $log->(0, "found $free free 'err' objects\n") if defined $free;
+    return 1 unless $free;
+    my @free = object_count('err', 0); # 0 == FREE
+    open RESULT, ">>clusters/$conf{cluster}/$conf{name}.files" or die $!;
+    for (@free){
+      my $chunk = $_->[0];
+      next if 
+        statshift('lock' => 'err' => $chunk)->is_error;
+   	  print RESULT "$chunk\n";
+    }
+    close RESULT;
+	return 1;
+  };
+}
+
+# returns a closure which maintains a checkpointed "corpus" of input chunks left
+# REWRITE TO USE HASHTABLE WITH DELETIONS ?
+sub input_checkpointer {
+  my ($source, $target, $port) = @_;
+  my $log = logger('input checkpointer');
+  my %conf = %{ corpus($source) };
+  $conf{name} .= '[input]';
+  writecorpus(\%conf);
+
+  my $count = 0;
+  return sub {
+    my ($unlocked, $locked) = object_count('in');
+    my $current = $unlocked + $locked;
+    $log->(0, "found $current unfinished inputs\n");
+    unless ($current){ # finish up if nothing left
+      $log->(0, "unlinking checkpoint corpus, exiting\n");
+      unlinkcorpus(\%conf);
+      return 0;
+    }
+    return 1 if $current == $count;
+	$count = $current;
+
+    $log->(0, "recording $current 'in' objects in $conf{name}\n");
+    my @free = object_count('in', 0); # 0 == FREE
+    my @lokd = object_count('in', 1); # 1 == LOKD
+    @{$conf{files}} = map { $_->[0] } @free, @lokd;
+    writecorpus(\%conf);
+    return 1;
+  };
+}
+
+ 
+# CHOPPER - takes list of code refs, returns code ref.
+# Upon kick, code ref executes top function. If it returns FALSE,
+# shifts closure off. Returns FALSE when all funcs are exhausted.
+sub chopper {
+  my @funcs = @_;
+
+  return sub {
+    while(@funcs){
+      my $retval = $funcs[0]->();
+      return $retval if $retval;
+      shift @funcs;
+    }
+    return 0; 
+  };
+}
+
+
+sub usage {
+  return <<USAGE;
+
+    Copyright (C) 2009 H5 Technologies, Ira Woodhead
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+
+The Robot Army
+
+Corpus control commands:
+
+      robots /command/ [args] {options}
+    
+      help [command]          (print this usage list [or usage details for "command")
+      list [corpus]           (list of all corpora [or detail of "corpus"])
+      rollcall                (inventories all hosts systemwide)
+      init "corpus" {options} (create empty corpus, with options overriding defaults)
+      add "corpus" ["source"] (add "source" - a file, files, or a dir - to 
+                                    the corpus, treating each file as one record.
+                                    If no source is given, add STDIN to corpus)
+      cat "corpus"              (print entire corpus contents to STDOUT)
+      head "corpus" N           (print first N records to STDOUT)
+      tail "corpus" N           (print last N records to STDOUT)
+      slice "corpus" I N        (print N records to STDOUT, starting with record I)
+      delete "corpus"           (delete all traces of a corpus on all hosts)
+      empty "corpus"            (clear all data out of a corpus)
+      check "corpus"            (checks integrity of corpus, reporting any oddities)
+      repair "corpus"           (repairs a corpus if possible)
+      rename "corpus" "newname"   (renames a corpus to newname)
+      copy "corpus" "newcorpus" {options}   (copies existing corpus to newcorpus)
+      append "corpus" "other"   (adds corpus data to existing corpus "other")
+      sync "cluster"            (synchronize the current dir as an Execution Environment)
+      cmd "cluster" /shellcmd/  (execute /shellcmd/ on each host in this cluster, one by one)
+
+      Options for init and/or copy commands (defaults in conf/ct.conf): 
+      -repos          (directory on hosts to keep data files)
+      -replicate      (replication factor)
+      -chunksize      (target uncompressed data file size)
+      -rs             (record separator)
+	  -uncompressed   (turn off compressing data files)
+    
+
+Distributed processing commands:
+
+      robots exec /command/ "output" {options}
+
+      robots map "input" /command/ "output" {options}
+
+      robots mapreduce "input" /transform/ /aggregate/ "output" {options}
+
+      Options for exec/map/mapreduce commands:
+      -maps=n           (number of processes to launch per host)
+      -replicate=n      (result corpus replication factor)
+      -nosort           (only for mapreduce - refrain from sorting before reducing)
+      -partition=P      (only for mapreduce - substitute a different partition program P)
+      -rs=s             (the output record separator, if not newline)
+      -crew=s           (the cluster to use for execution, if not the default)
+      -verbose          (master's execution log to the screen instead of to log file)
+
+Use "robots help COMMAND" for details on each.
+USAGE
+}
+
+
+sub cthelp {
+
+  my %help = (
+    help => <<HELP
+Usage: robots help [command]
+
+  Print out a usage string and examples for a specific Robot Army function, or
+  list all functions available.
+
+Examples:
+  robots help
+  robots help list
+  robots help mapreduce
+HELP
+,
+	list => <<LIST
+Usage: robots list [corpus]
+
+  Print a detailed listing of what corpora are available, with their 
+  characteristics and status. If a corpus is indicated, list all shadow
+  corpora associated as well.
+
+Examples:
+  robots list 
+  robots list odyssey
+  robots list homer/odyssey
+LIST
+,
+    rollcall => '',
+    init => <<INIT
+Usage: robots init "corpus" {options}
+
+  Create a new empty corpus, using default parameters overridden by any passed 
+  on the commandline.
+
+Examples: 
+  robots init twain/tomsawyer -rs="</DOC>" -chunksize=1K
+  robots init iliad
+  robots init homer/odyssey
+INIT
+,
+    copy => <<COPY
+Usage: robots copy "old" "new" {options}
+
+  Copy existing corpus, creating a new, identical corpus, using the settings 
+  of the original overridden by any commandline options. If the copy is to a
+  different cluster, the corpus name can be the same.
+
+Examples: 
+  robots copy homer/corpus1 twain/corpus1
+  robots copy corpus1 corpus1copy
+COPY
+,
+    add => <<ADD
+Usage: robots add "corpus" "source"
+
+  Converts data from a file, directory or stream and places it in a corpus.
+
+Examples: 
+  robots add odyssey odyssey.txt
+  cat odyssey.txt | ct add odyssey
+  robots add homer texts/
+ADD
+,
+    'delete' => <<DELETE
+Usage: robots delete "corpus"
+
+  Delete a corpus and all its data.
+
+Examples: 
+  robots delete homer/odyssey
+  robots delete iliad
+DELETE
+,
+    empty => <<EMPTY
+Usage: robots empty "corpus"
+
+  Empty out a corpus of its data, keeping the initialized corpus with all 
+  settings intact.
+
+Examples: 
+  robots empty odyssey
+  robots empty homer/odyssey
+EMPTY
+,
+    repair => <<REPAIR
+Usage: robots repair "corpus"
+
+  If possible, restore missing files from replicants, bringing the corpus up 
+  to full coherence.
+
+Examples: 
+  robots repair odyssey
+  robots repair homer/odyssey
+
+REPAIR
+,
+    'rename' => <<RENAME
+Usage: robots rename "corpus" "newname"
+
+  Rename a corpus.
+
+Examples:
+  robots rename odyssey homerbook
+  robots rename twain/tomsawyer twainbook
+RENAME
+,
+    append => <<APPEND
+Usage: robots append "anothercorpus" "corpus"
+
+  (This is mostly used internally). Add the contents of the first named corpus 
+  to the second. Analagous to "cat anothercorpus.txt >> corpus.txt".
+
+Examples:
+  robots append odyssey homerbooks
+  robots append iliad homerbooks
+APPEND
+,
+    cat => <<CAT
+Usage: robots cat "corpus"
+
+  Output the full corpus to STDOUT.
+
+Examples:
+  robots cat odyssey > odyssey.txt
+CAT
+,
+    head => <<HEAD
+Usage: robots head "corpus" [N]
+
+  Output the first chunk, or the chunks containing the first N records, to 
+  STDOUT. NOTE Along with "tail" and "slice", the output of this is confined 
+  to chunk granularity. For example, if the first chunk contains 1000 records 
+  and N is less than 1000, all of them will be output nevertheless. 
+
+Examples:
+  robots head odyssey > odyssey_first_chunk.txt
+  robots head odyssey 5 > odyssey_first_five_chapters.txt
+HEAD
+,
+    tail => <<TAIL
+Usage: robots tail "corpus" [N]
+
+  Output the last chunk, or the chunks containing last N records, to STDOUT. 
+  (But see note for head command regarding chunk granularity)
+
+Examples:
+  robots tail odyssey > odyssey_last_chunk.txt
+  robots tail odyssey 5 > odyssey_last_five_chapters.txt
+TAIL
+,
+    slice => <<SLICE
+Usage: robots slice "corpus" [N] [M]
+
+  Output the chunks containing the M records, starting at offset N, to STDOUT.
+  (But see note for head command regarding chunk granularity)
+
+Example:
+  robots slice odyssey 5 1 > chapterfive.txt
+SLICE
+,
+    check => <<CHECK
+Usage: robots check "corpus"
+
+  Verify the coherence of a corpus, printing details about any missing files 
+  or insufficient replication.
+
+Examples: 
+  robots check odyssey
+  robots check homer/iliad
+CHECK
+,
+    cmd => <<CMD
+Usage: robots cmd "cluster" /command/ {options}
+
+  Issue an arbitrary shell command on all hosts on "cluster". DANGER! You can
+  do a lot of damage with this command. The invocations are serial, so each
+  host will finish with its job before the next begins. This is appropriate
+  for short commands with brief output, such as 'ls -l' or 'df'. The execution
+  context on the master is *not* synchronized beforehand, and the starting 
+  position of the caller on each machine is the tt user home directory.
+
+  Adding the -verbose flag prints out each host name before that host's output.
+
+Examples:
+  robots cmd twain 'df -h repos/'
+  robots cmd homer 'du -sh context/'
+  robots cmd homer 'cksum .ssh/authorized_keys' -verbose
+  robots cmd homer 'rm -rf *' (SERIOUSLY, WILL ROBINSON. DANGER.)
+CMD
+,
+    'exec' => <<EXEC
+Usage: robots exec "cluster" /command/ "output" {options}
+
+  Issue an arbitrary shell command on all hosts in "cluster", saving the 
+  results in corpus "output". DANGER! You can do a lot of damage with this 
+  command. The invocations are parallel, so all hosts will execute at once. 
+  This is appropriate for long-running commands, or ones with large outputs 
+  that you'd like to save in a corpus. Also nice for administrative tasks. The 
+  execution context *is* synchronized, making it a convenient way to 
+  distribute a file or directory See examples for, e.g., a way to quickly 
+  update your known_hosts file to all tt users on a cluster. This is possible
+  since invocations are made from within the execution context, but the 
+  outside filesystem is fully accessible.
+
+  Adding the -verbose flag prints the execution log as feedback to STDOUT, 
+  rather than logging it to "output.log".
+
+Examples:
+  robots exec homer 'apt-get Digest::SHA1' sha1install -verbose
+  cd; robots exec homer 'rsync -av .ssh/known_hosts  ~/.ssh/known_hosts'
+EXEC
+,
+    'map' => <<MAP
+Usage: robots map "input" /command/ "output" {options}
+
+  Transform the contents of corpus "input" according to /command/, placing the 
+  result in corpus "output". Execution context is synchronized, and commands 
+  are invoked in parallel.
+
+Examples:
+  robots map iliad 'perl -ne "print if /agamemnon/i"' iliad-ag-lines
+  robots map iliad 'perl -ne "s/agamemnon/yourmom/i"' iliad-mom-version
+MAP
+,
+    mapreduce => <<MAPREDUCE
+Usage: robots mapreduce "input" /transform/ /aggregate/ "output" {options}
+
+  Transform the contents of corpus "input" according to the command 
+  /transform/, partition the results, and aggregate them using the command 
+  /aggregate/. Place the result in corpus "output". Execution context is 
+  synchronized, and commands are invoked in parallel.
+
+Examples:
+  robots mapreduce bigcorpus 'sed s/ /\\n/' 'uniq -c' bigcorp-wordcount
+(this example implements the global word frequency count task -- inefficiently)
+MAPREDUCE
+,
+  );
+
+  if(@_){
+    print $help{$_[0]} if exists $help{$_[0]};
+    return;
+  }
+  print usage();
+}
+
+
+# SHARED FUNCTIONS, robots + ttclient
+
+
+# return the preferred order of a consistent-hashing ring according to a key
+sub consistenthashring {
+  my ($key, $list) = @_;
+  my %seen;
+  $seen{$_}++ for @$list;
+  my $keyhash = sha1_hex($key);
+  my @hashes;
+  for my $item (keys %seen){
+    push @hashes, [ sha1_hex("$item:$_"), $item ] for (1..$seen{$item});
+  }
+  @hashes = sort @hashes;
+  my $keyindex = 0;
+  for (0..$#hashes){
+    next if $hashes[$_]->[0] lt $keyhash;
+    $keyindex = $_;
+    last;
+  }
+  if($keyindex != 0 and $keyindex != $#hashes){
+    @hashes = (@hashes[$keyindex .. $#hashes],
+               @hashes[0         .. $keyindex-1]);
+  }
+  %seen = ();
+  my @ring = map { $_->[1] } grep { ! $seen{$_->[1]}++ } @hashes;
+  return \@ring;
+}
+
+
+
+#
+# STATUS SERVICE COMMUNICATIONS
+#
+{
+  my ($ua, $url);
+  sub setsvc {
+    ( $ua, $url ) = @_;
+  }
+
+  sub object_count {
+    my ( $type, $state ) = @_;
+    my $uri = "$url/$type";
+    $uri .= "/$state" if defined $state;
+    my $log = logger("object count:$uri");
+    my $request = HTTP::Request->new( GET => $uri );
+    my $ref;
+    my $i = 0;
+    while (1) {
+      my $response = $ua->request($request);
+      if ( $response->is_success ) {
+        $ref = eval $response->content;
+        last;
+      }
+      else {
+        $log->( 1, "failed: [", $response->message, "] sleeping 2^$i seconds\n");
+        sleep 2**$i++;
+      }
+    }
+    return @$ref;
+  }
+
+  sub statshift {
+    my ( $action, $type, $id ) = @_;
+    my $request = HTTP::Request->new( PUT => "$url/$action/$type/$id" );
+    return $ua->request($request);
+  }
+
+  # register a type-labeled list of records, possibly retiring a source item atomically
+  sub register {
+    my ( $resulttype, $records, $origtype, $origid ) = @_;
+    my $recordstr = join( "\n", @$records );
+    my $uri = "$url/$resulttype";
+    $uri .= "/$origtype/$origid"
+      if defined $origtype
+      and defined $origid;
+    my $request = 
+      HTTP::Request->new( POST => $uri, 
+                          ['Content-Length' => length($recordstr)], 
+						  $recordstr);
+    return $ua->request($request);
+  }
+} # STATUS SVC
+
+
+# LOGGER SYSTEM
+{
+  my $fd;
+  my $level = 0;
+
+  sub setlog {
+    my ($filename, $lvl) = @_;
+    $level = $lvl;
+    die $! unless $fd = FileHandle->new($filename);
+  }
+
+  sub logger {
+    my ($id) = @_;
+    return sub {
+      my($msglevel, $message) = @_;
+	  if($msglevel >= $level){
+        print $fd localtime() . " [$id] " . $message;
+      }
+    };
+  }
+}
+
+
+# CONFIG
+
+# Make an anonymous variable reference.
+# This is necessary to abide by the Getopt::Long way.
+sub ar {
+  my $var = shift;
+  return \$var;
+}
+
+# Get all configuration info, with precedence given to cmdline
+sub cmdlineconf {
+  my %opts = @_;  
+
+  GetOptions( %opts );
+  
+  my %cmdline = 
+    map { (split '=', $_)[0] => expand_number(${$opts{$_}}) } 
+    grep { ${$opts{$_}} } 
+    keys %opts;
+  
+  return %cmdline;
+}  
+
+sub readconf {
+  my $fname = shift;
+  die "$fname not found.\n"   unless -e $fname;
+  my @c     = ();
+  open F, "<$fname";
+  while (<F>) {
+    chomp;
+    s/\r//;
+    next unless $_;
+    next if /^#/;
+    push @c, [ split /\t+/ ];
+  }
+  my %conf = ();
+  for my $list (@c) {
+    if ( @$list > 2 ) {    # this is a vector
+      push @{ $conf{ shift @$list } }, [@$list];
+    }
+    else {                 # this is a single key/value
+      push @{ $conf{ $list->[0] } }, expand_number($list->[1]);
+    }
+  }
+  
+  $conf{$_} = $conf{$_}->[0] for grep { @{$conf{$_}} == 1 } keys %conf;
+  
+  return %conf;
+}
+
+sub readlist {
+  my $fname = shift;
+  return [] unless -e $fname; 
+  my @list     = ();
+  open F, "<$fname";
+  while (<F>) {
+    chomp;
+    s/\r//;
+    next unless $_;
+    next if /^#/;
+    push @list, $_;
+  }
+  return \@list;
+}
+
+sub writeconf {
+  my %conf = %{ shift @_ };
+  my $dest = shift;
+  open CONF, ">$dest" or die $!;
+  for my $key (keys %conf){
+    if(ref $conf{$key}){
+      for my $val ( @{ $conf{$key} } ){
+        print CONF $key . "\t" . abbrev_number($val) . "\n";
+      }
+    } else {
+      print CONF $key . "\t" . abbrev_number($conf{$key}) . "\n";
+    }
+  }
+  close CONF;
+}
+
+sub writelist {
+  my ($file, $list) = @_;
+  open LIST, ">$file" or die $!;
+  print LIST join("\n", @$list);
+  close LIST;
+}
+
+sub abbrev_number {
+  my $n = shift;
+  $n =~ s/0{9}$/G/;
+  $n =~ s/0{6}$/M/;
+  $n =~ s/0{3}$/K/;
+  return $n;
+}
+
+sub expand_number {
+  my $n = shift;
+  return $n unless $n =~ /^\d+[KMG]$/i;
+  $n =~ s/G$/000000000/i;
+  $n =~ s/M$/000000/i;
+  $n =~ s/K$/000/i;
+  return $n;
+}
+
+
+
+

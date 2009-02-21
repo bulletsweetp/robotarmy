@@ -1,0 +1,264 @@
+
+
+
+=head1 THE ROBOT ARMY QUICK INSTALL GUIDE
+
+
+=head2 INSTALLATION OVERVIEW
+
+Installation consists of the following steps:
+
+=over
+
+=item * Install prerequisites on the master. The master is the machine used for invoking distributed commands, and serves as a central point of control for the purpose of tracking and global locking.
+
+=item * Establish a Robot Army home dir for the user or users who will be invoking the Army. This might be in a particular user's home dir or in a shared location for multiple users on the same master, such as /usr/share. In this document we'll make the simple assumption there will be one user for now, and this can be expanded later.
+
+=item * Designate a cluster of machines to add to the Army.
+
+=item * Set up the transport layer. This is by far the most involved step. Transport is based on B<ssh>, and how easy it is depends on what sort of access you have on the machines in the first place. For instance, at one extreme of difficulty, if you don't have root on all the machines it is quite tedious. By contrast, if you not only have root but also have auto-login set up for your root access to the machines, it is almost trivial.
+
+=item * Set some other configuration items.
+
+=back
+
+
+We make the following assumptions for the sake of explanation:
+
+=over
+
+=item * You have one machine to act as the master called B<masterhost>.
+
+=item * Three other machines are available to you as workers, called B<asimo, bender>, and B<clamps>. You have root on these machines, possibly -- but not necessarily -- with auto-login set up.
+
+=item * The username on worker machines will be called B<ra>.
+
+=item * The first cluster will be called B<stepford>.
+
+=back
+
+None of the above need be true. For instance the master machine can also participate in operations as a worker, or you may not like the name stepford, or the usernames on the accounts you have might not be uniform. For now we'll just use these as a starting point.
+
+
+=head1 Install prerequisites
+
+Set up lighttpd with FastCGI enabled (master only)
+
+Install perl modules FCGI and JSON (master only)
+
+Install libwww-perl (master and all workers)
+
+Install Digest::SHA1 (master and all workers)
+
+Make sure sshd is running on all machines.
+
+
+=head1 SET UP A ROBOT ARMY HOME DIR
+
+In your home dir:
+
+ # tar zxvf RobotArmy-x.xx.tar.gz
+ # mv RobotArmy-x.xx RobotArmy
+
+This creates ~/RobotArmy as the system's home dir (You can put it anywhere you like). Edit your B<.bashrc> to add eg
+
+ export ROBOTARMY=~/RobotArmy
+ export PATH=$ROBOTARMY/bin:$PATH
+
+...or wherever you put the home dir. Alternative: If you wish to have a multi-user system, you could put it in eg B</usr/share/RobotArmy>.
+
+ # source ~/.bashrc
+ # cd $ROBOTARMY
+
+Edit B<conf/tt.conf>.
+
+=over
+
+=item * Set B<master> to your username and host, ie B<user@masterhost>.
+
+=item * Set B<context> to the area you wish to designate on the workers as the execution context, eg B</home/ra/context>.
+
+=item * Set B<httpd> to your B<lighttpd> executable.
+
+=back
+
+Edit B<conf/ct.conf>.
+
+=over
+
+=item * Set B<repos> to the area you wish to designate on the workers as the data repository, eg B</home/ra/repos>. 
+
+=item * Set B<cluster> to the name of your first cluster of machines, eg B<stepford>.
+
+=back
+
+Note re B<context> and B<repos>: these must name directories writeable by your Robot Army user on worker machines in the system. They do not have to exist yet.
+
+=head1 CREATE A CLUSTER
+
+Assuming your first cluster will be named B<stepford>, make the dir B<clusters/stepford>:
+
+ # mkdir clusters/stepford
+
+and edit B<clusters/stepford-root/.hosts> to contain entries of the form B<user@hostname> ie:
+
+ ra@asimo
+ ra@bender
+ ra@clamps
+
+You can put comments (lines beginning with B<#>) or blank lines in, for logical groupings or notes on the different machines.
+
+In addition, we need to create an admin cluster usable by the root user on each worker. We have to have the root cluster to actually administer the machines and do things like create the special Robot Army user B<ra>. 
+
+Make another cluster in B<clusters/stepford-root/.hosts>, with entries of B<root@hostname>:
+
+ # cp -r clusters/stepford clusters/stepford-root
+
+ root@asimo
+ root@bender
+ root@clamps
+
+
+=head1 PREPARING THE AUTHENTICATION LAYER: GATHERING CREDENTIALS
+
+The Robot Army uses ssh as a transport layer, so you need to set up auto-logins between all hosts in your cluster(s) as well as the master.
+
+To do this you need:
+
+=over 
+
+=item * A master user keypair, whose public key will be known to all workers.
+
+=item * A list of all known hosts and their public keys.
+
+=item * A uniform worker keypair, allowing all workers to authenticate to each other.
+
+=back
+
+With these items we'll assemble the workers' uniform B<.ssh/> setup and distribute it to them. This consists of three items:
+
+=over
+
+=item * The B<known_hosts> file.
+
+=item * The B<authorized_keys> file.
+
+=item * The B<id_rsa> key pair.
+
+=back
+
+=head2 Generate an ssh key pair for the master user, if you don't already have one
+
+Call "ssh-keygen" as below, hitting return for all interactive questions. 
+
+ # ssh-keygen -t rsa
+
+NOTE: If you have a preexisting keypair with a passphrase associated with it, you can use it as long as you run under ssh-agent. See the docs for ssh.
+
+Authorize this user to himself.
+
+ # cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+ # ssh thishostname
+ # exit
+
+Append this to the workers' B<authorized_keys> to give you auto-login access:
+
+ # cat ~/.ssh/id_rsa.pub >> worker_dotssh/authorized_keys
+
+
+=head2 Generate an ssh key pair for the workers
+
+ # ssh-keygen -t rsa -f worker_dotssh/id_rsa
+
+Append this to the workers' B<authorized_keys> to give the workers auto-login access to each other:
+
+ # cat worker_dotssh/id_rsa.pub >> worker_dotssh/authorized_keys
+
+=head2 Scan for host keys
+
+ # perl scan.pl > worker_dotssh/known_hosts
+
+Append this to your own B<known_hosts> as well:
+
+ # cat worker_dotssh/known_hosts >> ~/.ssh/known_hosts
+
+
+At this point the B<worker_dotssh> dir should contain the following files:
+
+=over
+
+=item * B<authorized_keys> file containing the master's public key (same as master's B<~/.ssh/id_rsa.pub>)
+
+=item * B<known_hosts> file containing the scanned server identities.
+
+=item * B<id_rsa> and B<id_rsa.pub> worker key pair.
+
+=back
+
+
+
+=head1 PREPARING THE AUTHENTICATION LAYER: ESTABLISHING ROOT ACROSS THE CLUSTER
+
+We need to add this master user's public key to all the worker roots authorized_keys. First get a copy of the existing one, so we don't deauthorize someone else:
+
+ # scp root@asimo:.ssh/authorized_keys root_dotssh/authorized_keys
+
+Now append this user to the list:
+
+ # cat ~/.ssh/id_rsa.pub >> root_dotssh/authorized_keys
+
+Now the B<authorized_keys> file should have at least this master user's public key in it, as well as any preexisting keys for other root users.
+
+Push the credential to all root users on all hosts in the cluster using the B<push.pl> utility:
+
+ # perl push.pl stepford-root root_dotssh/authorized_keys .ssh/authorized_keys
+
+You'll have to type in passwords for these just this once. Afterward, logins should be automatic between master and root on the workers. 
+
+
+=head1 CREATING ROBOT ARMY USER ACROSS THE CLUSTER
+
+Now that we have root across the cluster we can get our special Robot Army user on it using B<robots cmd> and B<push.pl>:
+
+ # robots cmd stepford-root 'useradd -m -G users ra'
+ # perl push.pl stepford-root worker_dotssh
+ # robots cmd stepford-root 'rsync -a worker_dotssh/ ~ra/.ssh'
+ # robots cmd stepford-root 'chown -R ra:users ~ra/.ssh'
+ # robots cmd stepford-root 'rm -rf worker_dotssh'
+
+... Those last steps are just cleanup.
+
+NOTE: Please see Hack #66 in the excellent B<Linux Server Hacks> by Rob Flickenger for details beyond the above instructions.
+
+
+=head1 TEST YOUR ROBOTS
+
+Try out B<stepford> cluster using the B<cmd> command to check out the system. For example B<robots cmd stepford 'ls -l .ssh/' -verbose> will give you a listing of each worker's B<.ssh> dir.
+
+If that succeeds, you can more thoroughly test your setup by calling B<perl t/CT.t> and then B<perl t/TT.t>. These will perform several corpus seating, map, and mapreduce operations on stepford.
+
+Calling B<robots> with no args will give you a rundown of all the commands and options, and you can find more detailed command instructions by calling B<robots COMMAND>.
+
+
+=head1 ADDING CLUSTERS
+
+You can create as many clusters as you want, by making the dir plus dothosts file B<clusters/name/.hosts>. To install credentials on any new machines, repeat the scan and push the known_hosts to all the clusters. For instance, B<clusters/westworld/.hosts> and B<clusters/holodeck/.hosts>:
+
+ # perl scan.pl > worker_dotssh/known_hosts
+ # perl push.pl stepford  worker_dotssh/known_hosts .ssh/known_hosts
+ # perl push.pl westworld worker_dotssh/known_hosts .ssh/known_hosts
+ # perl push.pl holodeck  worker_dotssh/known_hosts .ssh/known_hosts
+
+
+=head1 ADDING USERS
+
+If you want to have a multi-user system you can add authentication credentials for another user by adding her public key:
+
+ # cat other_id_rsa.pub >> worker_dotssh/authorized_keys
+ # perl push.pl stepford worker_dotssh/authorized_keys .ssh/authorized_keys
+
+This example authorizes her for B<stepford> but not for any other cluster.
+
+
+
+

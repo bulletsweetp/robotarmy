@@ -1,0 +1,84 @@
+#!/usr/bin/perl -w
+use strict;
+
+use FileHandle;
+use Digest::SHA1 qw( sha1 );
+use Getopt::Long;
+
+# set the input record separator
+$/ = $ENV{TTRS} if exists $ENV{TTRS};
+$/ = eval $/ if $/ =~ /^['"]/;
+
+my ($path, $sig, $cluster) = splice @ARGV, 0, 3;
+
+my $hosts = readlist("$path/client/clusters/$cluster/.hosts");
+chomp @$hosts;
+calchashring($hosts);
+
+my @table;
+while(<>){
+  my ($key) = split /\t/;
+  next unless defined $key;
+  my $part = keyindex($key);
+
+  $table[$part] ||=
+    new FileHandle ">$path/parts/$part/$sig" 
+      or die $!;
+
+  $table[$part]->print($_);
+}
+
+for (0..$#table){
+  $table[$_]->close if defined $table[$_];
+}
+
+exit 0;
+
+
+
+{
+  my @ring = ();
+
+  # calculate the consistent-hashing ring
+  sub calchashring {
+    my ($list) = @_;
+    my %seen;
+    $seen{$_}++ for @$list;
+    my @hashes;
+    for my $item ( keys %seen ) {
+      push @hashes, [ unpack("N", sha1 "$item:$_"), $item ]
+        for ( 1 .. $seen{$item} );
+    }
+    @ring = sort { $a->[0] <=> $b->[0] } @hashes;
+  }
+
+# given a key and the consistent-hash ring, return the index of the responsible slot
+  sub keyindex {
+    my ($key) = @_;
+    my $keyhash = unpack("N", sha1 $key);
+    my $keyindex = 0;
+    for ( 0 .. $#ring ) {
+      next if $ring[$_]->[0] < $keyhash;
+      $keyindex = $_;
+      last;
+    }
+    return $keyindex;
+  }
+}
+
+
+sub readlist {
+  my $fname = shift;
+  return [] unless -e $fname; 
+  my @list     = ();
+  open F, "<$fname";
+  while (<F>) {
+    chomp;
+    s/\r//;
+    next unless $_;
+    next if /^#/;
+    push @list, $_;
+  }
+  return \@list;
+}
+

@@ -1,0 +1,284 @@
+
+=head1 NAME
+
+The Robot Army: command-oriented distributed processing
+
+
+=head1 SYNOPSIS
+
+  On the commandline:
+
+  # robots cmd /command/
+  # robots exec /command/ "output"
+  # robots map "input" /command/ "output"
+  # robots mapreduce "input" /map/ /reduce/ "output"
+
+  # robots help
+  # robots help [command]
+ 
+
+=head1 DESCRIPTION
+
+
+The Robot Army is a generalized distributed processing system. The main aspects making this system different are:
+
+=over
+
+=item * Replicated B<execution contexts>, making new operations easy to build and test. 
+
+=item * A built-in B<sequential-access> data store flexible enough to handle any type of data.
+
+=item * B<Command-orientation> allows existing programs to be used, and makes programming B<language-agnostic>.
+
+=item * Simple and non-intrusive installation, making it easy to assemble a cluster and get started right away.
+
+=back
+
+Execution context, in the form of your current directory hierarchy, is replicated from your local machine to all workers. This makes distributing commands much easier than if a single executable were the only thing allowable as a distributed program.
+
+Access to data is through the built-in data store, a simple and uniquely flexible sequential access format that provides high throughput.
+
+The Robot Army is B<command-oriented>. This is as opposed to B<program-oriented>. This means any arbitrary command that already works on one machine should be usable in a distributed way. You therefore need not write new programs using an API. The API is B<stdin, stdout> and B<stderr>.
+
+The simpler a system is, the easier it is to make it do more without breaking. The Robot Army is meant to be as simple as possible while still being powerful enough. A competent programmer should be able to read and understand the code in less than a day. The first releases are under 1000 loc. Based on shared ssh keys and remote calls, and using a lightweight RESTish state tracking mechanism, it is currently suitable for clusters of at least several hundred machines, while still being easy to both learn and use.
+
+
+=head1 OPERATIONS
+
+The Robot Army supports four basic types of operation: 
+
+=over
+
+=item * cmd /command/
+
+=item * exec /command/ "output"
+
+=item * map "input" /command/ "output"
+
+=item * mapreduce "input" /map/ /reduce/ "output"
+
+=back
+
+These four differ in whether they have input and/or output corpora (in the built-in data store), whether they use the current execution context, and whether they are sequential or parallel. In the case of B<mapreduce>, the difference also involves an intervening partition and aggregation phase of processing.
+
+The B<cmd> operation takes an arbitrary command and executes it sequentially, without replicated execution context, and without an input or output corpus on the data store. This is suitable for basic administrative tasks such as deleting temp files or comparing the available memory of machines in a cluster. The output of B</command/> is simply written to B<stdout> and B<stderr>.
+
+The B<exec> operation takes an arbitrary command and executes it on all hosts in parallel, using the execution context. The output of B</command/> is written to a distributed output corpus.
+
+The B<map> operation is a generalized transform taking in an input corpus, using the execution context, and producing an output corpus. 
+
+The B<mapreduce> operation uses two programs to first B<transform> (/map/), B<partition>, and B<aggregate> (/reduce/) an input corpus to an output corpus. The partition phase is implicit in the operation and happens behind the scenes.
+
+
+
+
+
+
+=head1 ABOUT MAPREDUCE: HOW TO PROCESS ANY SIZE DATASET
+
+The basic idea of mapreduce is simple and powerful enough to begin using it on a single machine, as in this example.
+
+To understand the mapreduce operation in the context of distributed processing you are strongly encouraged to read the google paper (http://labs.google.com/papers/mapreduce.html) before proceeding further, as it will make everything much clearer.
+
+=head2 Example: Wordcount
+
+Consider the problem of counting all the occurrences of every unique word in a corpus of documents. We wish to print out records consisting of word/frequency pairs.
+
+Here is a working program to do this:
+
+  ## file wc.pl
+  my %words;
+  while(<>){
+    $words{$_}++ for split /\W+/;
+  }
+  print "$_\t$words{$_}\n" for keys %words;
+
+This can be used by saying:
+
+  # cat corpus.txt | wc.pl > result.txt
+
+This program will work with small datasets. Larger ones will break it by eating up the memory, since the table storing values will grow too large to fit. The way around this is to output intermediate data, sort it, and then aggregate it. For this we need two separate programs and a sort in between.
+  
+
+First we modify the above to output intermediate data per input record. This is done by moving the structure to the scope of one record instead of the scope of the whole corpus:
+
+(In this case records are lines of text, but they could be any format)
+
+  ## file: wc.m
+  while(<>){
+    my %words;
+    $words{$_}++ for split /\W+/;
+    print "$_\t$words{$_}\n" for keys %words;
+  }
+
+NOTE: Notice the simple difference between wc.pl and wc.m
+
+  
+Then we write a program to aggregate - or reduce - the resulting data once it has been sorted. It requires a bit of boilerplate to check whether the partitioned key has changed, but otherwise it is trivial:
+
+  ## file: wc.r
+  my ($key, $sum) = ('', 0);
+  while(<>){
+    chomp;
+    my($newkey, $val) = split /\t/;
+    if($key eq $newkey){
+      $sum += $val;
+      next;
+    }
+    print "$key\t$sum\n";
+    $key = $newkey;
+    $sum = $val;
+  }
+  print "$key\t$sum\n" if $key;
+
+This pair of programs can be used on a single machine by invoking:
+
+  # cat corpus.txt | ./wc.m | sort | ./wc.r > result.txt
+
+This method can take an arbitrarily large corpus and still complete, assuming you have enough disk to store the intermediate results in the sort program's temp files.
+
+The Robot Army package essentially does this, only across multiple machines. In fact, those very program listings of B<wc.m> and B<wc.r> work within the system already.
+
+We can use the B<mapreduce> operation with a distributed corpus called B<odyssey>, like so:
+
+ # robots mapreduce odyssey ./wc.m ./wc.r odyssey_wc
+
+Notice the similarity between this invocation and the single machine example above.
+ 
+A new distributed corpus called odyssey_wc, containing records of the form "word\tsum\n" will appear in the default cluster.
+
+
+
+
+
+=head1 THE ROBOT ARMY DATA STORE
+
+The data store for the Robot Army is:
+
+=over
+
+=item * Not a relational database (like Oracle, MySQL or Postgres)
+
+=item * Not a key/value store (like Amazon's Dynamo or Google's BigTable)
+
+=back
+
+It is instead a very simple B<flat record> store designed with B<sequential access> in mind. Records consist of blobs with no separate key and value, and are accessed and interpreted by the user commands.
+
+The data is stored in a series of chunks of a minimum size, which are replicated and distributed over machines in a cluster. Commands coordinate access to them by way of a centralized locking service, accessed via a RESTish http protocol. Commands prefer local chunks to process first, if possible.
+
+Sequential access provides for superior data throughput. It may be that there exists, or will exist in the future, some key/value store designed to have the best of both random and sequential access. Accordingly, the Robot Army is designed to be easily modified to take advantage of a separate data store.
+
+
+=head1 CORPUS DETAILS
+
+A corpus is defined with a B<corpus handle> which resides in B<clusters/clustername/> inside the Robot Army home dir. The corpus handle is simply two files named for the corpus. One contains some configuration info, and the other a list of data chunks for all the data in the corpus.
+
+For example, if a corpus is called B<odyssey> and is seated on cluster B<homer>, the handle would be comprised of the files B<odyssey> and B<odyssey.files> in the B<clusters/homer/> dir.
+
+The config info is:
+
+=over 2
+
+=item B<repos> - path to the data store dir on all participating machines
+
+=item B<replicate> - replication factor for data files
+
+=item B<chunksize> - target uncompressed size of data files
+
+=item B<rs> - corpus record separator
+
+=back
+
+The data file names consists of three parts. 
+
+=over 2
+
+=item - A 160-bit SHA1 content signature in hex form
+
+=item - The number of records in the chunk
+
+=item - The size in bytes of the uncompressed chunk.
+
+=back
+
+Example: ec4980119752c864ad04ff4d72fb4de2e42ed3fa.19450.256003779
+
+
+
+
+=head1 END HERE?
+
+
+=head1 USING ROBOTARMY
+
+Type "robots help" for a list of all built-in operations, commands, and options.
+
+A typical call looks like this:
+
+  # robots map odyssey 'wc' odyssey_totals
+
+ (equivalent to "cat odyssey | wc > odyssey_totals")
+
+  # robots mapreduce odyssey ./wc.m ./wc.r odyssey_wc
+
+ (equivalent to "cat odyssey | ./wc.m | sort | ./wc.r > odyssey_wc")
+
+If something goes wrong and you need to clean up, this will get rid of the distributed output corpus:
+
+  # robots delete odyssey_wc
+
+The B<cmd> and B<exec> operations are quite useful in practice, but be careful, especially with B<rm>! 
+
+
+
+
+=head1 The Robot Army vs Other Implementations
+
+There are at least two other implementations of this processing model: Google's original, and a Lucene-related project called B<Hadoop>. Google wrote theirs in C++, while the Lucene authors used Java.
+
+Compared to the other, much more involved versions, this is more or less a toy.
+
+A quite significant difference is the absense of a distributed file system. Google uses "GFS" to make input files available to map tasks, while this implementation simply stores distributed files across the cluster so that each host is responsible for the files on its local storage. This requires a preliminary "distribution step" which partitions a set of records across all hosts. This is quite simple since it can be implemented as a MapReduce operation! See 'partition.m' and 'remove_keys.r' in the bin directory for examples. This turns out to be more convenient than it looks, because often you will want to perform another mapreduce operation on the results of the last, and in this way the files are already distributed.
+
+Hadoop appears much more "enterprise", which is to say it is more complicated. It has four xml configuration files (The Robot Army has only one, on one machine), and a lot ... a B<lot> ... of code. It's no doubt much more stable, and also harder to get started. Not to mention there are no Perl bindings.
+
+Just a bit more comment on relative complexity. The current Hadoop build has 313 java files with 61,810 lines of code. This doesn't include non-java files. There are 14 jsp files, 13 sh files, and 586 html files, plus. You could not check out the source code and understand everything in half a day. I'm not disparaging the Hadoop effort at all. It's probably very high quality. However the basic concept is very simple, and it might be possible to have a simple yet stable implementation.
+
+Even though this version is probably not as stable as the others, it comprises just over 800 lines of code in three executable files. It has one configuration file, can be used almost immediately with very minimal effort, and is rather noninvasive, requiring nothing but distributing shared ssh keys on pool machines.
+
+In short, perfect for exploring, understanding, and profitably using the MapReduce concepts with near-trivial time investment.
+
+It's my goal to have a very sound system with comparable performance and stability to Google or Hadoop, using so little code that it can be read and understood in less than a day by a normal programmer.
+
+
+=head1 LOAD BALANCING AND FAULT TOLERANCE
+
+
+In the Robot Army, the input data are distributed evenly across hosts with a tunable B<replication factor> which garuantees that F-1 hosts can go down at any time and the operation will still complete. The number of hosts that can B<actually> go down is larger, and is related to the total amount of input data, but I have yet to do an analysis of what that is. The concept of B<shared responsibility> provides load balancing, in that each machine is responsible for making sure all files residing locally are processed, and will step up to do the processing of nonlocal files themselves if given the opportunity (ie if finishing previous files faster than its brothers). In practice this works well. The spread between the first machine finishing and the last machine finishing is bound by the amount of time it takes to process one corpus file (usually a matter of a couple-few minutes, depending on your task).
+
+
+=head1 TO DO
+
+I would like to improve the Robot Army as much as possible while still conforming to the goals of simplicity, stability and performance. If you have suggestions for elegant improvements, get in touch with me.
+
+
+=head1 SEE ALSO
+
+http://labs.google.com/papers/mapreduce.html
+
+Linux Server Hacks, Rob Flickenger
+
+
+=head1 AUTHOR
+
+Ira Woodhead, E<lt>ira at sweetpota dot toE<gt>
+
+
+
+
+
+
+
+
+

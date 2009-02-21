@@ -1,0 +1,720 @@
+#!/usr/bin/perl
+use strict;
+
+#    ttclient - The Robot Army client code.
+#
+#    Copyright (C) 2009 H5 Technologies, Ira Woodhead
+#    
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#  
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+use 5.006;
+use strict;
+use warnings;
+
+use FileHandle;
+use Digest::SHA1 qw{ sha1_hex };
+use LWP::UserAgent;
+use HTTP::Request;
+use Getopt::Long;
+use POSIX 'setsid';
+
+my $scp = 'scp -q -o "ConnectTimeout 3"';
+
+my %conf = readconf("conf/task.conf");
+my @args = @ARGV;
+@ARGV = ();
+my $cmd = $conf{cmd};
+die "Unknown task" unless 
+  (grep { $cmd eq $_ } qw{ map mapreduce exec });
+
+$cmd = "tt$cmd";
+$cmd = \&$cmd;
+daemonize( @args );
+setsvc( LWP::UserAgent->new, "http://$conf{master}:$conf{statusport}/ttstatus" );
+setlog('>&STDERR', 0);
+$cmd->(\%conf, @args);
+exit;
+
+
+
+
+# The simple map task.
+# 
+sub ttmap {
+  my ($conf, $k) = @_;
+  my %conf = %$conf;
+  
+  my %source = %{ corpus($conf{source}) };
+  my %target = %{ corpus($conf{target}) };
+  my @crew      = @{ readlist("clusters/$conf{crew}/.hosts") };
+  my $targetpath = "$target{repos}/$target{nodename}";
+  my $src_rs = "TTRS='$source{rs}'"; # a hint to the map cmd
+  my $log = logger("$crew[$k] ttmap");
+
+  my @localfiles = map { (m|([^/]+)$|) } glob("$source{repos}/$source{nodename}/*");
+  my $in = lockloop('in', \@localfiles); 
+  while (my $chunk = $in->()) {
+    last unless @$chunk;
+    my ($name, @locations) = @$chunk;
+    my $file = "$source{repos}/$source{nodename}/$name";
+    my $sig = substr($name,0,40);
+    my $err = "$targetpath/client/err/$sig";
+
+    unless (-e $file){
+      statshift( free => in => $name )  && next unless @locations;
+      retrieve_foreign( $file, @locations ); 
+      statshift( free => in => $name )  && next unless -e "foreign/$name";
+      $file = "$targetpath/client/foreign/$name";
+    }
+    my $stream = (exists $source{uncompress} ? 'cat' : 'gunzip -c');
+    my $pipe = "cd $conf{context}/$conf{proj}; $stream $file | $src_rs $conf{mapcmd} 2>$err > $targetpath/$sig-mapped";
+
+    my $retval = system $pipe;
+    if( $retval ){
+      $log->(0, "mapped $name with retval ". ($retval>>8) .". (Error, REVERTING)\n");
+      statshift( free => in => $name );
+      unlink "foreign/$name" if -e "foreign/$name";
+      next;
+    }
+
+    my $count = seatstream($sig, FileHandle->new("<$targetpath/$sig-mapped"), \%target, $k);
+    unlink "$targetpath/$sig-mapped";
+    unlink "foreign/$name" if -e "foreign/$name";
+    my $rstat = register( out => [], in => $name );
+    $log->(0, "simplemap'd and distributed $name, to $count out chunks, retired with status ". $rstat->code ."\n");
+
+    my $errbytes = -s $err;
+    rename $err, "$err.1.$errbytes";
+    register('err' => [ "$sig.1.$errbytes" ]);
+  }
+  
+  $log->(0, "finished map tasks.\n");
+}
+
+
+
+
+# map with partition, then reduce. If reduce fails, reexecute.
+sub ttmapreduce {
+  my $reduced = 0;
+  until($reduced){
+    mappartition(@_);
+    $reduced = reduce(@_);
+  }
+}
+
+sub mappartition {
+  my ( $conf, $k ) = @_;
+  my %conf = %$conf;
+
+  my %source = %{ corpus($conf{source}) };
+  my %target = %{ corpus($conf{target}) };
+  my @crew     = @{ readlist("clusters/$conf{crew}/.hosts") };
+  my $targetpath = "$target{repos}/$target{nodename}"; 
+  my $src_rs = "TTRS='$source{rs}'";
+  my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : ''; # any RS passed is for partitioner and reducer
+  my $log = logger("$crew[$k] mappartition");
+  
+  $conf{partition} ||= 'partition';
+
+  unless (-d "$targetpath/parts"){
+    mkdir "$targetpath/parts";
+    mkdir "$targetpath/parts/$_" for (0..$#crew);
+  }
+  
+  my @localfiles = map { (m|([^/]+)$|) } glob("$source{repos}/$source{nodename}/*");
+  my $in = lockloop('in', \@localfiles); 
+  while ( my $chunk = $in->() ) {
+    last unless @$chunk;
+    my ( $name, @locations ) = @$chunk;
+    my $file = "$source{repos}/$source{nodename}/$name";
+    my $sig = substr( $name, 0, 40 );
+    my $err = "$targetpath/client/err/$sig";
+
+    unless (-e $file){
+      statshift( free => in => $name )  && next unless @locations;
+      retrieve_foreign( $file, @locations ); 
+      statshift( free => in => $name )  && next unless -e "foreign/$name";
+      $file = "$targetpath/client/foreign/$name";
+    }
+    my $stream = (exists $source{uncompress} ? 'cat' : 'gunzip -c');
+    my $pipe = 
+      "cd $conf{context}/$conf{proj}; " .
+      "$stream $file | $src_rs $conf{mapcmd} 2>$err | " .
+      "$mid_rs $targetpath/client/bin/$conf{partition} $targetpath $name $conf{crew}";
+
+    my $retval = system $pipe;
+    if( $retval ){
+      $log->(0, "mapped $name with retval ". ($retval>>8) .". (Error, REVERTING)\n");
+      statshift( free => in => $name );
+      unlink "foreign/$name" if -e "foreign/$name";
+      next;
+    }
+
+    my @parts = map { (m|/(\d+)/[^/]+$|) } glob("$targetpath/parts/*/$name");
+
+    $log->(0, "map'd $sig to ". scalar @parts ." parts\n");
+    register(part => \@parts, in => $name);
+    unlink "foreign/$name" if -e "foreign/$name";
+
+    my $errbytes = -s $err;
+    rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
+    register('err' => [ "$sig.1.$errbytes" ]);
+  }
+  $log->(0, "finished map tasks.\n");
+
+}
+
+
+# For each partition, sort all files in that partition by key, 
+# and pipe through the reduce program to a series of segmented
+# result files.
+sub reduce {
+  my ($conf, $k) = @_;
+  my %conf = %$conf;
+
+  my %target     = %{ corpus($conf{target}) };
+  my @crew       = @{ readlist("clusters/$conf{crew}/.hosts") };
+  my $targetpath = "$target{repos}/$target{nodename}";
+  my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : ''; # any RS passed is for partitioner and reducer
+  my $log = logger("$crew[$k] reduce");
+
+  $log->(0, "NOT sorting.\n") if $conf{nosort};
+
+  my @results;
+  my $parts = lockloop('part');
+  while(my $partobj = $parts->()){
+    last unless @$partobj;
+    my ($part, @sources) = @$partobj;
+    $log->(0, "locked partition $part\n");
+
+    my @frags = assemble_fragments("$targetpath/parts", $part, $k, \@crew);
+    $log->(0, "got ". scalar @frags ." frags from partition $part.\n");
+    statshift(free => part => $part) && next unless @frags;
+
+    # verify all fragments are present for this partition
+    my ($missing, $extra) = compare_sets(\@sources, \@frags);
+    if(@$missing){
+      $log->(0, scalar @$missing ." fragments missing from partition $part, skipping.\n");
+      statshift( free => part => $part );
+      statshift( free => in   => $_ ) for @$missing;
+      return 0; # reexecute the map phase
+    }
+
+    my $err = "$targetpath/client/err/$part"; 
+    my $pipe;
+    unless($conf{nosort}){
+      die "Sort error" if system "sort -o $targetpath/$part-sorted $targetpath/parts/$part/*";
+      unlink glob("$targetpath/parts/$part/*") or warn "Problem unlinking partition $part";
+      @frags = ("$targetpath/$part-sorted");
+      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $targetpath/$part-sorted | $conf{reducecmd} 2>$err |";
+    } else {
+      my $ins = "$targetpath/" . join " $targetpath/", @frags;
+      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $ins | $mid_rs $conf{reducecmd} 2>$err |";
+    }
+
+    my $count = seatstream($part, $pipe, \%target, $k);
+    unlink @frags;
+    my $rstat = register(out => [], part => $part);
+    $log->(0, "distributed reduction $part, to $count out chunks, retired with status ". $rstat->code  ."\n");
+
+    my $errbytes = -s $err;
+    rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
+    register('err' => [ "$part.1.$errbytes" ]);
+  }
+
+  $log->(0, "finished reduce task\n");
+  return 1;
+}
+
+
+sub ttexec {
+  my ( $conf, $k ) = @_;
+  my %conf = %$conf;
+
+  my %target     = %{ corpus( $conf{target} ) };
+  my @crew       = @{ $target{hosts} };
+  my $targetpath = "$target{repos}/$target{nodename}";
+  my $log        = logger("$crew[$k] exec");
+  my $env        = "TTRS='$target{rs}' TTHOST=$k";
+  my $sig        = sha1_hex($crew[$k]);
+  my $err        = "$targetpath/client/err/$sig";
+  $log->( 0, "source lock failed" ) unless
+    statshift('lock' => source => $crew[$k])->is_success;
+
+  my $pipe = "cd $conf{context}/$conf{proj}; $env $conf{mapcmd} 2>$err";
+  my $chunks = seatstream( $sig, FileHandle->new("$pipe|"), \%target, $k );
+  register( 'out' => [], source => $crew[$k] );
+  $log->( 0, "exec finished seating $chunks chunks.\n" );
+
+  my $errbytes = -s $err;
+  rename $err, "$err.1.$errbytes";
+  register( 'err' => ["$sig.1.$errbytes"] );
+  $log->( 0, "finished exec task.\n" );
+}
+
+
+sub compare_sets {
+  my($left, $right) = @_;
+  my %left  = map { $_ => 1 } @$left;
+  my %right = map { $_ => 1 } @$right;
+
+  for (@$right){
+    if(exists $left{$_}){
+      delete $left{$_};
+      delete $right{$_};
+    }
+  }
+  my @left  = keys %left;
+  my @right = keys %right;
+  return(\@left, \@right);
+}
+
+
+# returns an iterator for objects of the given type, starting with 
+# a given list of object ids. Each object returned is garuanteed to
+# be locked. Blocks until it can provide a locked object. Returns an 
+# empty list ref when objects are no longer available.
+sub lockloop {
+  my ($type, $list) = @_;
+  my @free = ();
+  @free = map { [ $_ ] } @$list if defined $list;
+  my $log = logger("lockloop on $type");
+
+  return sub {
+    while(1){
+      while(@free){
+        my $obj = shift @free;
+        next unless statshift('lock' => $type => $obj->[0])->is_success;
+        return $obj;
+      }
+      my $sleepytime = 0;
+      while(1){
+        my($free,$locked) = object_count($type);
+        $log->(0, "$free free / $locked locked objex, exiting lockloop\n") && return [] 
+          unless $free or $locked;
+        if($free){
+          $log->(0, "$free free / $locked locked objex\n");
+          @free = object_count($type, 0); # zero means status "FREE"
+          last;
+        }
+        $log->(0, "$free free / $locked locked objex, sleeping ". 2**$sleepytime ." seconds\n");
+        sleep $sleepytime**2;
+        $sleepytime++ unless $sleepytime >= 2; # 4 seconds to sleep, max
+      }
+    }
+  };
+}
+
+
+# Retrieve a foreign input file to the local drive
+sub retrieve_foreign {
+  my($file, @hosts) = @_;
+  for (@hosts){
+    my ($sig) = ($file =~ /\/([a-f\d]{40})\.\d+\.\d+$/);
+    last unless system "$scp $_\:$file foreign/.";
+  }
+}
+
+# gather fragments from hosts in randomized order
+sub assemble_fragments {
+  my ( $dir, $part, $thishost, $hosts ) = @_;
+  my @hosts = @$hosts;
+  my $ihosts = fyshuffle( $part, scalar @hosts );
+  for my $i (@$ihosts) {
+    system "$scp -q $hosts[$i]:$dir/$part/* $dir/$part/. 2>/dev/null";
+  }
+  my @parts = map { (m|([^/]+)$|) } glob("$dir/$part/*");
+  return @parts;
+}
+
+# NOTE this leaves the source file where it is if appropriate
+sub distribute {
+  my($seed, $src, $dest, $k, $fway, $hosts) = @_;
+  my $preflist = consistenthashring( $seed, $hosts );
+  $fway = @$hosts if (@$hosts < $fway); # can't replicate more than there are hosts
+  my $owngoal = 0;
+  my $thishost = $hosts->[$k];
+  my $log = logger("$thishost distribute");
+
+  my $copies = 0;
+  for my $target (@$preflist){
+    last if $copies >= $fway;
+    if (($target eq $thishost) and ($src eq $dest)){
+      $log->(0, "setting owngoal for copy to myself\n");
+      $owngoal = 1;
+      $copies++;
+      next;
+    }
+    my $ret = system "$scp $src $target:$dest";
+    if($ret){
+      $log->(0, "could not copy to $target (". ($ret>>8) .")\n");
+    } else {
+      $log->(0, "copied to $target\n");
+      $copies++;
+    }
+  }
+  unlink $src unless $owngoal;
+  return undef unless $copies;
+  return 1;
+}
+
+
+# fisher-yates shuffle returns indices for an array of $size elements.
+# produces same shuffle with same seed.
+sub fyshuffle {
+  my( $seed, $size ) = @_;
+  my $array = [ 0..$size-1 ];
+  srand($seed);
+  my $i;
+  for ( $i = @$array ; --$i ; ) {
+    my $j = int rand( $i + 1 );
+    next if $i == $j;
+    @$array[ $i, $j ] = @$array[ $j, $i ];
+  }
+  return $array;
+}
+
+
+sub seatstream {
+  my ( $sig, $fd, $conf, $k ) = @_;
+  my %conf = %$conf;
+  my $rs   = $conf{rs};
+  my @crew = @{ $conf{hosts} };
+
+  $rs = eval $rs if ( $rs =~ /^["']/ );
+  local $/ = $rs if $rs;
+  my $sha = Digest::SHA1->new;
+  my ( $outfd, $records, $bytes );
+  my $chunks = 0;
+  my $log = logger("$crew[$k] seatstream");
+
+  # begin a new output file
+  my $startoutfile = sub {
+    my $stream = (exists $conf->{uncompress} ? '' : '|gzip');
+    $outfd   = new FileHandle "$stream>$sig-out" or die $_;
+    $bytes   = 0;
+    $records = 0;
+  };
+
+  # do this when enough has been output
+  my $endoutfile = sub {
+    $outfd->close;
+    $sha->addfile( new FileHandle "<$sig-out" );
+    my $chunksig = $sha->hexdigest . ".$records.$bytes";
+    rename "$sig-out", $chunksig;
+    $chunks++;
+    if ($bytes > 0){ 
+      distribute(hex substr($chunksig,0,8), $chunksig, 
+                 "$conf{repos}/$conf{nodename}/$chunksig", $k, $conf{replicate}, $conf{hosts});
+      my $rstat = register( out => [ $chunksig ] );
+      $log->( 0, "distributed $chunks th chunk, registered with status " . $rstat->code . "\n");
+    } else { 
+      my $rstat = register( out => [ $chunksig ] );
+      $log->( 0, "$chunks th chunk empty, not distributing, registered with status " . $rstat->code . "\n");
+      unlink $chunksig; 
+    }
+  };
+
+  $startoutfile->();
+  while (<$fd>) {
+    $bytes += length $_;
+    print $outfd $_;
+    $records++;
+    if ( $bytes >= $conf{chunksize} ) {
+      $endoutfile->();
+      $startoutfile->();
+    }
+  }
+  $endoutfile->();
+  return $chunks;
+}
+
+
+sub daemonize {
+  my($machine, $cpu) = @_; 
+  open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+  my $logname = sprintf "%020x%020x.1.0", $machine, $cpu;
+  open STDOUT, ">log/$logname" or die "Can't write to client/log: $!";
+  defined(my $pid = fork) or die "Can't fork: $!";
+  exit if $pid;
+  setsid                  or die "Can't start a new session: $!";
+  open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+}
+
+
+
+
+
+# construct a corpus type
+sub corpus {
+  my $corpus = shift;
+  my ($cluster, $name) = cluster_and_corpus($corpus);
+  my %conf;
+  if( -e "clusters/$cluster/$name" ){
+    %conf = readconf("clusters/$cluster/$name");
+  } else {
+    %conf = readconf('conf/ct.conf');
+  }
+  $conf{hosts} = readlist("clusters/$cluster/.hosts");
+  $conf{files} = readlist("clusters/$cluster/$name.files");
+  $conf{name}    = $name;
+  $conf{cluster} = $cluster;
+  return \%conf;
+}
+
+
+# nail down which cluster and corpus name
+sub cluster_and_corpus {
+  my $corp = shift;
+  die "No corpus specified" unless $corp;
+  my @spec = split /\//, $corp;
+  die "cluster/corpus is malspecified: $corp" if @spec > 2;
+  if(@spec == 2){
+    die "No such cluster $spec[0]" unless -d "clusters/$spec[0]";
+    return @spec;
+  }
+  my %conf = readconf('conf/ct.conf'); 
+  return ($conf{cluster}, $corp) if -e "clusters/$conf{cluster}/$corp";
+  my @candidates = glob("clusters/*/$corp");
+  return ($conf{cluster}, $corp) if @candidates == 0; # non-existent
+  die "$corp exists in multiple non-default clusters" if @candidates > 1;
+  $candidates[0] =~ s|^clusters/||;
+  return (split m|/|, $candidates[0]);
+}
+
+
+
+
+
+# SHARED CODE, robots+ttclient
+
+
+# return the preferred order of a consistent-hashing ring according to a key
+sub consistenthashring {
+  my ($key, $list) = @_;
+  my %seen;
+  $seen{$_}++ for @$list;
+  my $keyhash = sha1_hex($key);
+  my @hashes;
+  for my $item (keys %seen){
+    push @hashes, [ sha1_hex("$item:$_"), $item ] for (1..$seen{$item});
+  }
+  @hashes = sort @hashes;
+  my $keyindex = 0;
+  for (0..$#hashes){
+    next if $hashes[$_]->[0] lt $keyhash;
+    $keyindex = $_;
+    last;
+  }
+  if($keyindex != 0 and $keyindex != $#hashes){
+    @hashes = (@hashes[$keyindex .. $#hashes],
+               @hashes[0         .. $keyindex-1]);
+  }
+  %seen = ();
+  my @ring = map { $_->[1] } grep { ! $seen{$_->[1]}++ } @hashes;
+  return \@ring;
+}
+
+
+# STATUS SERVICE COMMUNICATIONS
+#
+{
+  my ($ua, $url);
+  sub setsvc {
+    ( $ua, $url ) = @_;
+  }
+
+  sub object_count {
+    my ( $type, $state ) = @_;
+    my $uri = "$url/$type";
+    $uri .= "/$state" if defined $state;
+    my $log = logger("object count on $type");
+    my $request = HTTP::Request->new( GET => $uri );
+    my $ref;
+    my $i = 0;
+    while (1) {
+      my $response = $ua->request($request);
+      if ( $response->is_success ) {
+        $ref = eval $response->content;
+        last;
+      }
+      elsif( $response->code == 404) {
+        $log->( 0, "status svc has no $type objex. Sleeping". 2^$i ."seconds\n");
+        sleep 2**$i++;
+      } else {
+        $log->( 0, "no status svc, abandoning job, exiting (". $response->code .")\n"); 
+        die; 
+      }
+    }
+    return @$ref;
+  }
+
+  sub statshift {
+    my ( $action, $type, $id ) = @_;
+    my $request = HTTP::Request->new( PUT => "$url/$action/$type/$id" );
+    return $ua->request($request);
+  }
+
+  # register a type-labeled list of records, possibly retiring a source item atomically
+  sub register {
+    my ( $resulttype, $records, $origtype, $origid ) = @_;
+    $records = join( "\n", @$records );
+    my $uri = "$url/$resulttype";
+    $uri .= "/$origtype/$origid"
+      if defined $origtype
+      and defined $origid;
+    my $request = 
+      HTTP::Request->new( POST => $uri, 
+                          ['Content-Length' => length($records)], 
+                          $records);
+    return $ua->request($request);
+  }
+} # STATUS SVC
+
+
+# LOGGER SYSTEM
+{
+  my $fd;
+  my $level = 0;
+
+  sub setlog {
+    my ($filename, $lvl) = @_;
+    $level = $lvl;
+    die $! unless $fd = FileHandle->new($filename);
+  }
+
+  sub logger {
+    my ($id) = @_;
+    return sub {
+      my($msglevel, $message) = @_;
+      if($msglevel >= $level){
+        print $fd localtime() . " [$id] " . $message;
+      }
+    };
+  }
+}
+
+
+# CONFIG - this code should be identical to the same section in CT
+
+# Make an anonymous variable reference.
+# This is necessary to abide by the Getopt::Long way.
+sub ar {
+  my $var = shift;
+  return \$var;
+}
+
+# Get all configuration info, with precedence given to cmdline
+sub cmdlineconf {
+  my %opts = @_;  
+
+  GetOptions( %opts );
+  
+  my %cmdline = 
+    map { (split '=', $_)[0] => expand_number(${$opts{$_}}) } 
+    grep { ${$opts{$_}} } 
+    keys %opts;
+  
+  return %cmdline;
+}  
+ 
+
+
+sub readconf {
+  my $fname = shift;
+  return () unless -e $fname; 
+  my @c     = ();
+  open F, "<$fname";
+  while (<F>) {
+    chomp;
+    s/\r//;
+    next unless $_;
+    next if /^#/;
+    push @c, [ split /\t+/ ];
+  }
+  my %conf = ();
+  for my $list (@c) {
+    if ( @$list > 2 ) {    # this is a vector
+      push @{ $conf{ shift @$list } }, [@$list];
+    }
+    else {                 # this is a single key/value
+      push @{ $conf{ $list->[0] } }, expand_number($list->[1]);
+    }
+  }
+  
+  $conf{$_} = $conf{$_}->[0] for grep { @{$conf{$_}} == 1 } keys %conf;
+  
+  return %conf;
+}
+
+
+sub readlist {
+  my $fname = shift;
+  return [] unless -e $fname; 
+  my @list     = ();
+  open F, "<$fname";
+  while (<F>) {
+    chomp;
+    s/\r//;
+    next unless $_;
+    next if /^#/;
+    push @list, $_;
+  }
+  return \@list;
+}
+
+
+sub writeconf {
+  my %conf = %{ shift @_ };
+  my $dest = shift;
+  open CONF, ">$dest" or die $!;
+  for my $key (keys %conf){
+    if(ref $conf{$key}){
+      for my $val ( @{ $conf{$key} } ){
+        print CONF $key . "\t" . abbrev_number($val) . "\n";
+      }
+    } else {
+      print CONF $key . "\t" . abbrev_number($conf{$key}) . "\n";
+    }
+  }
+  close CONF;
+}
+
+
+sub abbrev_number {
+  my $n = shift;
+  $n =~ s/0{9}$/G/;
+  $n =~ s/0{6}$/M/;
+  $n =~ s/0{3}$/K/;
+  return $n;
+}
+
+sub expand_number {
+  my $n = shift;
+  return $n unless $n =~ /^\d+[KMG]$/;
+  $n =~ s/G$/000000000/i;
+  $n =~ s/M$/000000/i;
+  $n =~ s/K$/000/i;
+  return $n;
+}
+
+
+__END__
+
+=head1 NAME
+
+ttclient - client side infrastructure for the B<RobotArmy> system. See pod docs for B<tt> or B<ct>.
+

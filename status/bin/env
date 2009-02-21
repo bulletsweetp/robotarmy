@@ -1,0 +1,56 @@
+#!/usr/bin/perl
+
+package EnvResource;
+
+use HTTP::Status;
+use lib "/Users/ira/WWW-Resource/lib";
+use WWW::Resource;
+@ISA = qw( WWW::Resource );
+
+sub GET {
+  return ( RC_OK, \%ENV );
+}
+
+sub PUT {
+  local $/ = undef;
+  my $body = <STDIN>;
+  $ENV{MESSAGE_BODY} = $body;
+  return ( RC_OK, \%ENV );
+}
+
+sub POST {
+  PUT(@_);
+}
+
+sub DELETE {
+  return ( RC_OK, \%ENV );
+}
+
+
+EnvResource->run();
+
+
+__DATA__
+
+=pod
+
+This program echoes the web server environment variables to the client. A browser can be used to check things by calling 
+
+ http://localhost:3000/env?format=browser 
+
+assuming you are running on port 3000. 
+
+It can also be verified that the MESSAGE_BODY of a POST or PUT call is available through the STDIN filehandle. You can do this by calling 
+
+ telnet localhost 3000
+
+and pasting this text
+
+POST env?format=json HTTP/1.0
+Content-length: 33
+
+123456789
+987654321
+abcdefghi
+
+

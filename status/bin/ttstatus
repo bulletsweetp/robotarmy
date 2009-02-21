@@ -1,0 +1,253 @@
+#!/usr/bin/perl
+
+#    ttstatus - the FastCGI status service for The Robot Army 
+#
+#    Copyright (C) 2009 H5 Technologies, Ira Woodhead
+#    
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#  
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+########################################################
+############# cgi setup preliminaries ##################
+########################################################
+
+
+
+use FCGI;
+use IO::Handle;
+use CGI qw(:standard); # convenience functions
+use HTTP::Status;
+
+use Data::Dumper;
+$Data::Dumper::Useqq = 1;
+
+use JSON;
+$JSON::SingleQuote = 1;
+
+my %formats = (
+  perl => sub { my $obj = Dumper $_[0]; substr($obj,0,7) = ''; return $obj; },
+  json => sub { objToJson( $_[0], {pretty => 1, indent => 4} ) },
+  browser => \&browserprint,
+);
+
+
+
+my $request = FCGI::Request;
+while ( $request->Accept >= 0 ) {
+
+  my $method = $ENV{REQUEST_METHOD};
+
+  if ( grep { $_ eq $method } qw( HEAD GET POST PUT ) ) {
+    my $handler = \&$method;
+    my %query = map { split /=/ } split /;/, lc $ENV{QUERY_STRING};
+    $ENV{MESSAGE_BODY} .= $_ while <STDIN>;
+    my( $status, $obj ) = $handler->(\%query);
+    return_result(  $status, $obj );
+  } else {
+    return_result( RC_NOT_IMPLEMENTED );
+  }
+}
+
+sub return_result {
+  my ( $status, $obj ) = @_;
+  my $status_msg = join " ", $status, status_message($status);
+
+  if ( is_error($status) or !defined $obj ) {
+    print header( -status => $status_msg );
+    return;
+  }
+
+  my %query = map { split /=/ } split /;/, lc $ENV{QUERY_STRING};
+  my $formatter = $formats{perl};
+  $formatter = $formats{ $query{format} }
+        if (exists $query{format}
+        and exists $formats{ $query{format} });
+
+  print header( -status => $status_msg );
+  
+  print ref $obj ? $formatter->($obj) : $obj;
+  return;
+}
+
+
+# Format the data structure for browser viewing. This is an incredibly
+# stupid prettyprint. It simply places an html break at all newlines.
+sub browserprint {
+  my $obj = shift;
+  my $dumped = Dumper $obj;
+  substr($dumped, 0, 7) = '';
+  $dumped =~ s/\n/<br>\n/g;
+  return start_html("Pretty-printed Data Structure") . $dumped . end_html;
+}
+
+
+
+
+########################################################
+############# actual status service code ###############
+########################################################
+
+# OBJECT TABLE
+# $o{TYPE}->{ID}->[STATE,BASIS]
+# TYPE  : string
+# ID    : string
+# STATE : enum of FREE, LOKD, RTRD
+# BASIS : list
+
+# STATE COUNT TABLE
+# $c{TYPE}->[FREE,LOKD,RTRD,OOPS]
+
+use constant STATE => 0;
+use constant BASIS => 1;
+
+# states
+use constant FREE => 0;
+use constant LOKD => 1;
+use constant RTRD => 2;
+use constant OOPS => 3;
+
+{
+  my %o = ();
+  my %c = ();
+
+  sub listify {
+    my ( $type, $state ) = @_;
+    return undef unless exists $o{$type};
+    my @records = ();
+    for my $k ( keys %{$o{$type}} ){
+      push @records, [ $k, @{ $o{$type}->{$k}->[BASIS] } ]
+        if $o{$type}->{$k}->[STATE] == $state;
+    }
+    return \@records;
+  }
+
+  sub count {
+    my $type = shift;
+	if(defined $type){
+      return undef unless exists $c{$type};
+      return @{ $c{$type} };
+    } else {
+      return map { [ $_, @{$c{$_}} ] } keys %c;
+    }
+  }
+
+  sub create {
+    my($type, $list, @old) = @_;
+    unless( exists $o{$type} ){
+      @{ $c{$type} } = (0,0,0,0);
+    }
+    for my $item (@$list){
+	  unless( exists $o{$type}->{$item} ){
+        $o{$type}->{$item}->[STATE] = FREE;
+        $c{$type}->[FREE]++;
+		#print STDERR "created new record $item :: $type (@old)\n";
+      }
+      push @{ $o{$type}->{$item}->[BASIS] }, @old;
+    }
+    1;
+  }
+
+  sub set_state {
+    my($type, $id, $from, $to) = @_;
+	return undef unless exists $o{$type}
+                    and exists $o{$type}->{$id}
+                           and $o{$type}->{$id}->[STATE] == $from;
+
+    #print STDERR "changing $type :: $id state from $from to $to\n";
+    $o{$type}->{$id}->[STATE] = $to;
+    $c{$type}->[$from]--;
+    $c{$type}->[$to]++;
+	$c{$type}->[OOPS]++ if $to == FREE; # freeing an obj irreversibly increments the oops
+	1;
+  }
+
+}
+
+
+
+
+
+
+# get all 'inventory' records, or all of a certain type, or a single record
+sub GET {
+  my (undef, $type, $state) = split(m|/|, $ENV{PATH_INFO});
+  my $basis;
+  if(defined $type and defined $state){
+    $basis = listify($type, $state);
+	#print STDERR "TTSTATUS returning ", scalar @$basis, " basis items for type $type, state $state\n";
+  } elsif ($type){
+    $basis = [ count($type) ];
+	#print STDERR "TTSTATUS returning [", join(",", @$basis), "], basis counts for type $type\n";
+  } else {
+    $basis = [ count() ];
+	#print STDERR "TTSTATUS returning counts for types [", join(",", map {$_->[0]} @$basis), "]\n";
+  }
+
+  return RC_OK, $basis if defined $basis;
+  #print STDERR "TTSTATUS returning RC_NOT_FOUND for type $type, state $state (", RC_NOT_FOUND, ")\n";
+  return RC_NOT_FOUND;
+}
+
+
+
+# create/update new record(s) while possibly retiring a source record
+# of a different type. Refuse repeated attempts to retire same record.
+sub POST {
+  my (undef, $rtype, $otype, $oid) = split(m|/|, $ENV{PATH_INFO});
+  
+  # only locked records can be retired
+  my @oid = ();
+  if(defined $oid){
+    unless( set_state($otype, $oid, LOKD, RTRD) ){
+      #print STDERR "TTSTATUS returning RC_NOT_FOUND for action REGISTER, new type $rtype, retiree $oid :: $otype (", RC_NOT_FOUND, ")\n";
+      return RC_NOT_FOUND;
+    }
+    @oid = ($oid);
+  }
+
+  #print STDERR "TTSTATUS creating new records of type $rtype\n$ENV{MESSAGE_BODY}";
+  my @new = split /\n/, $ENV{MESSAGE_BODY};
+  create($rtype, \@new, @oid);
+
+  return RC_CREATED;
+}
+
+# change the state of an inventory object, usually to lock it
+sub PUT {
+  my (undef, $action, $type, $id) = split(m|/|, $ENV{PATH_INFO});
+
+  unless( grep {$_ eq $action} qw{ lock free unretire }){
+    #print STDERR "TTSTATUS returning RC_BAD_REQUEST for action $action, type $type, id $id (", RC_BAD_REQUEST, ")\n";
+	return RC_BAD_REQUEST;
+  }
+
+  my ($from, $to);
+  ($from, $to) = (FREE, LOKD) if $action eq 'lock';
+  ($from, $to) = (LOKD, FREE) if $action eq 'free';
+  ($from, $to) = (RTRD, FREE) if $action eq 'unretire';
+
+  unless( set_state($type, $id, $from, $to) ){
+    #print STDERR "TTSTATUS returning RC_NOT_FOUND for action $action, type $type, id $id (", RC_NOT_FOUND, ")\n";
+    return RC_NOT_FOUND;
+  }
+
+  #print STDERR "TTSTATUS returning RC_ACCEPTED for action $action, type $type, id $id (", RC_ACCEPTED, ")\n";
+  return RC_ACCEPTED;
+}
+
+
+
+
+
