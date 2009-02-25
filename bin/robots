@@ -36,6 +36,7 @@ die 'No RobotArmy home found. Please set $ROBOTARMY environment variable.'
   unless exists $ENV{ROBOTARMY};
 
 chdir $ENV{ROBOTARMY} or die $!;
+require "lib/shared.pl";
 
 my %OPTS = (
   "replicate=i" => ar(0),        # f-way replication
@@ -139,7 +140,7 @@ sub cluster_and_corpus {
   }
   my %conf = readconf('conf/ct.conf'); 
   return ($conf{cluster}, $corp) if -e "clusters/$conf{cluster}/$corp";
-  my @candidates = glob("clusters/*/$corp");
+  my @candidates = glob("clusters/*/" . quotemeta $corp);
   return ($conf{cluster}, $corp) if @candidates == 0; # non-existent
   die "$corp exists in multiple non-default clusters" if @candidates > 1;
   $candidates[0] =~ s|^clusters/||;
@@ -837,6 +838,7 @@ sub create_sandbox {
   system "cp -r client $client";
   system "cp -r clusters/*           $client/clusters/."; # a bit brutish
   system "cp -r conf                 $client/conf";
+  system "cp -r lib                  $client/lib";
   system "cp $mr{partition}          $client/bin/." if exists $mr{partition};
   system "cp client/bin/*            $client/bin/.";
   writeconf(\%mr, "$client/conf/task.conf");
@@ -1493,221 +1495,5 @@ MAPREDUCE
   }
   print usage();
 }
-
-
-# SHARED FUNCTIONS, robots + ttclient
-
-
-# return the preferred order of a consistent-hashing ring according to a key
-sub consistenthashring {
-  my ($key, $list) = @_;
-  my %seen;
-  $seen{$_}++ for @$list;
-  my $keyhash = sha1_hex($key);
-  my @hashes;
-  for my $item (keys %seen){
-    push @hashes, [ sha1_hex("$item:$_"), $item ] for (1..$seen{$item});
-  }
-  @hashes = sort @hashes;
-  my $keyindex = 0;
-  for (0..$#hashes){
-    next if $hashes[$_]->[0] lt $keyhash;
-    $keyindex = $_;
-    last;
-  }
-  if($keyindex != 0 and $keyindex != $#hashes){
-    @hashes = (@hashes[$keyindex .. $#hashes],
-               @hashes[0         .. $keyindex-1]);
-  }
-  %seen = ();
-  my @ring = map { $_->[1] } grep { ! $seen{$_->[1]}++ } @hashes;
-  return \@ring;
-}
-
-
-
-#
-# STATUS SERVICE COMMUNICATIONS
-#
-{
-  my ($ua, $url);
-  sub setsvc {
-    ( $ua, $url ) = @_;
-  }
-
-  sub object_count {
-    my ( $type, $state ) = @_;
-    my $uri = "$url/$type";
-    $uri .= "/$state" if defined $state;
-    my $log = logger("object count:$uri");
-    my $request = HTTP::Request->new( GET => $uri );
-    my $ref;
-    my $i = 0;
-    while (1) {
-      my $response = $ua->request($request);
-      if ( $response->is_success ) {
-        $ref = eval $response->content;
-        last;
-      }
-      else {
-        $log->( 1, "failed: [", $response->message, "] sleeping 2^$i seconds\n");
-        sleep 2**$i++;
-      }
-    }
-    return @$ref;
-  }
-
-  sub statshift {
-    my ( $action, $type, $id ) = @_;
-    my $request = HTTP::Request->new( PUT => "$url/$action/$type/$id" );
-    return $ua->request($request);
-  }
-
-  # register a type-labeled list of records, possibly retiring a source item atomically
-  sub register {
-    my ( $resulttype, $records, $origtype, $origid ) = @_;
-    my $recordstr = join( "\n", @$records );
-    my $uri = "$url/$resulttype";
-    $uri .= "/$origtype/$origid"
-      if defined $origtype
-      and defined $origid;
-    my $request = 
-      HTTP::Request->new( POST => $uri, 
-                          ['Content-Length' => length($recordstr)], 
-						  $recordstr);
-    return $ua->request($request);
-  }
-} # STATUS SVC
-
-
-# LOGGER SYSTEM
-{
-  my $fd;
-  my $level = 0;
-
-  sub setlog {
-    my ($filename, $lvl) = @_;
-    $level = $lvl;
-    die $! unless $fd = FileHandle->new($filename);
-  }
-
-  sub logger {
-    my ($id) = @_;
-    return sub {
-      my($msglevel, $message) = @_;
-	  if($msglevel >= $level){
-        print $fd localtime() . " [$id] " . $message;
-      }
-    };
-  }
-}
-
-
-# CONFIG
-
-# Make an anonymous variable reference.
-# This is necessary to abide by the Getopt::Long way.
-sub ar {
-  my $var = shift;
-  return \$var;
-}
-
-# Get all configuration info, with precedence given to cmdline
-sub cmdlineconf {
-  my %opts = @_;  
-
-  GetOptions( %opts );
-  
-  my %cmdline = 
-    map { (split '=', $_)[0] => expand_number(${$opts{$_}}) } 
-    grep { ${$opts{$_}} } 
-    keys %opts;
-  
-  return %cmdline;
-}  
-
-sub readconf {
-  my $fname = shift;
-  die "$fname not found.\n"   unless -e $fname;
-  my @c     = ();
-  open F, "<$fname";
-  while (<F>) {
-    chomp;
-    s/\r//;
-    next unless $_;
-    next if /^#/;
-    push @c, [ split /\t+/ ];
-  }
-  my %conf = ();
-  for my $list (@c) {
-    if ( @$list > 2 ) {    # this is a vector
-      push @{ $conf{ shift @$list } }, [@$list];
-    }
-    else {                 # this is a single key/value
-      push @{ $conf{ $list->[0] } }, expand_number($list->[1]);
-    }
-  }
-  
-  $conf{$_} = $conf{$_}->[0] for grep { @{$conf{$_}} == 1 } keys %conf;
-  
-  return %conf;
-}
-
-sub readlist {
-  my $fname = shift;
-  return [] unless -e $fname; 
-  my @list     = ();
-  open F, "<$fname";
-  while (<F>) {
-    chomp;
-    s/\r//;
-    next unless $_;
-    next if /^#/;
-    push @list, $_;
-  }
-  return \@list;
-}
-
-sub writeconf {
-  my %conf = %{ shift @_ };
-  my $dest = shift;
-  open CONF, ">$dest" or die $!;
-  for my $key (keys %conf){
-    if(ref $conf{$key}){
-      for my $val ( @{ $conf{$key} } ){
-        print CONF $key . "\t" . abbrev_number($val) . "\n";
-      }
-    } else {
-      print CONF $key . "\t" . abbrev_number($conf{$key}) . "\n";
-    }
-  }
-  close CONF;
-}
-
-sub writelist {
-  my ($file, $list) = @_;
-  open LIST, ">$file" or die $!;
-  print LIST join("\n", @$list);
-  close LIST;
-}
-
-sub abbrev_number {
-  my $n = shift;
-  $n =~ s/0{9}$/G/;
-  $n =~ s/0{6}$/M/;
-  $n =~ s/0{3}$/K/;
-  return $n;
-}
-
-sub expand_number {
-  my $n = shift;
-  return $n unless $n =~ /^\d+[KMG]$/i;
-  $n =~ s/G$/000000000/i;
-  $n =~ s/M$/000000/i;
-  $n =~ s/K$/000/i;
-  return $n;
-}
-
-
 
 
