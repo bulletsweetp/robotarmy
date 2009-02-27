@@ -24,7 +24,7 @@ use strict;
 use warnings;
 
 use FileHandle;
-use Digest::SHA1 qw{ sha1 sha1_hex };
+use Digest::MD5 qw{ md5 md5_hex };
 use LWP::UserAgent;
 use HTTP::Request;
 use Getopt::Long;
@@ -250,7 +250,7 @@ sub ttexec {
   my $targetpath = "$target{repos}/$target{nodename}";
   my $log        = logger("$crew[$k] exec");
   my $env        = "TTRS='$target{rs}' TTHOST=$k";
-  my $sig        = sha1_hex($crew[$k]);
+  my $sig        = md5_hex($crew[$k]);
   my $err        = "$targetpath/client/err/$sig";
   $log->( 0, "source lock failed" ) unless
     statshift('lock' => source => $crew[$k])->is_success;
@@ -397,7 +397,7 @@ sub seatstream {
 
   $rs = eval $rs if ( $rs =~ /^["']/ );
   local $/ = $rs if $rs;
-  my $sha = Digest::SHA1->new;
+  my $digest = Digest::MD5->new;
   my ( $outfd, $records, $bytes );
   my $chunks = 0;
   my $log = logger("$crew[$k] seatstream");
@@ -413,8 +413,8 @@ sub seatstream {
   # do this when enough has been output
   my $endoutfile = sub {
     $outfd->close;
-    $sha->addfile( new FileHandle "<$sig-out" );
-    my $chunksig = $sha->hexdigest . ".$records.$bytes";
+    $digest->addfile( new FileHandle "<$sig-out" );
+    my $chunksig = $digest->hexdigest . ".$records.$bytes";
     rename "$sig-out", $chunksig;
     $chunks++;
     if ($bytes > 0){ 

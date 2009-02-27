@@ -5,7 +5,7 @@ sub hashring {
   my ($vnodes, $list) = @_;
   my @ring = ();
   for my $item (@$list){
-    push @ring, [ sha1("$item:$_"), $item ] for (1..$vnodes);
+    push @ring, [ md5("$item:$_"), $item ] for (1..$vnodes);
   }
   @ring = sort { $a->[0] cmp $b->[0] } @ring;
   return \@ring;
@@ -14,16 +14,8 @@ sub hashring {
 # return the preferred order of items in a consistent-hashing ring according to a key
 sub preflist {
   my ($key, $ring) = @_;
-  my $keyhash = sha1($key);
+  my $keyhash = md5($key);
   my @ring = @$ring;
-
-#  # dumb linear search, needs to be faster
-#  my $keyindex = 0;
-#  for (0 .. scalar(@$ring)-1){
-#    next if $ring->[$_]->[0] lt $keyhash;
-#    $keyindex = $_;
-#    last;
-#  }
 
   my $keyindex = vnode_index($key, $ring);
 
@@ -39,9 +31,9 @@ sub preflist {
 # smarter search, via brad via rj
 sub vnode_index {
   my ($key, $ring) = @_;
-  my $keyhash = sha1($key);
+  my $keyhash = md5($key);
 
-  my $zeroval = pack("B*", '0' x 160); # "null sha1"
+  my $zeroval = pack("B*", '0' x 160); # "null md5"
   my ($lo, $hi) = (0, scalar(@$ring)-1);
 
   while (1) {

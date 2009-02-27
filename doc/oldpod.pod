@@ -194,7 +194,7 @@ The data file names consists of three parts.
 
 =over 2
 
-=item - A 160-bit SHA1 content signature in hex form
+=item - A 128-bit MD5 content signature in hex form
 
 =item - The number of records in the chunk
 
@@ -202,7 +202,7 @@ The data file names consists of three parts.
 
 =back
 
-Example: ec4980119752c864ad04ff4d72fb4de2e42ed3fa.19450.256003779
+Example: ec4980119752c864ad04ff4d72fbd3fa.19450.256003779
 
 
 

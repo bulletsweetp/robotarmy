@@ -48,8 +48,6 @@ Install perl modules FCGI and JSON (master only)
 
 Install libwww-perl (master and all workers)
 
-Install Digest::SHA1 (master and all workers)
-
 Make sure sshd is running on all machines.
 
 

@@ -6,7 +6,6 @@ WriteMakefile(
   NAME              => 'RobotArmy',
   VERSION_FROM      => 'bin/robots', # finds $VERSION
   PREREQ_PM         => { Getopt::Long => 0.00,
-                         Digest::SHA1 => 0.00,
                          LWP => 0.00 , 
                          FCGI => 0.67,
                          JSON => 1.14, },

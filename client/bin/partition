@@ -2,7 +2,7 @@
 use strict;
 
 use FileHandle;
-use Digest::SHA1 qw( sha1 );
+use Digest::MD5 qw( md5 );
 use Getopt::Long;
 
 # set the input record separator
@@ -45,7 +45,7 @@ exit 0;
 	my @list = @$list;
     for my $i (0..$#list){
       my $item = $list[$i];
-      push @ring, [ sha1("$item:$_"), $i ] for (1..$vnodes);
+      push @ring, [ md5("$item:$_"), $i ] for (1..$vnodes);
     }
     @ring = sort { $a->[0] cmp $b->[0] } @ring;
   }
@@ -54,9 +54,9 @@ exit 0;
 # smarter search, via brad via rj
 sub keyindex {
   my ($key) = @_;
-  my $keyhash = sha1($key);
+  my $keyhash = md5($key);
 
-  my $zeroval = pack("B*", '0' x 160); # "null sha1"
+  my $zeroval = pack("B*", '0' x 128); # "null md5"
   my ($lo, $hi) = (0, $#ring);
 
   while (1) {

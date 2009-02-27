@@ -20,7 +20,7 @@
 use strict;
 no strict 'refs';
 use FileHandle;
-use Digest::SHA1 qw{ sha1 sha1_hex };
+use Digest::MD5 qw{ md5 md5_hex };
 use Getopt::Long;
 use LWP::UserAgent;
 use HTTP::Request;
@@ -172,8 +172,8 @@ sub ctadd {
   my %conf = %$conf;
   die "Cannot add to shadow corpus" if $conf{name} =~ /\]$/;
   die "Corpus not found." unless corpusexists($conf);
-  my $corpsig = sha1_hex($conf{name}); # get a symbol to use locally
-  my $sha = new Digest::SHA1;
+  my $corpsig = md5_hex($conf{name}); # get a symbol to use locally
+  my $sha = new Digest::MD5;
   my $RS = $conf{rs}; 
   $RS = eval $RS if ($RS =~ /^["']/);
   my ($bytes, $records);
@@ -316,9 +316,9 @@ sub chunkmeta {
   return (0,0,0) unless corpusexists(\%conf);
   my ($chunks, $records, $bytes) = (scalar @{$conf{files}},0,0);
   for ( @{$conf{files}} ){
-    if(m|^[\da-f]{40}\.(\d+)\.(\d+)$|){
-      $records += $1;
-      $bytes   += $2;
+    if( my(undef, $r, $b) = chunksignature($_) ){
+      $records += $r;
+      $bytes   += $b;
     }
   }
   return ($chunks, $records, $bytes);
@@ -373,7 +373,7 @@ sub ctslice {
     map  { $_->[2] }
     grep { $_->[1] < $offset+$runlen }
     grep { $_->[0] >= $offset }
-    map { my($r) = (m|^[\da-f]{1,40}\.(\d+)\.\d+$|); 
+    map { my(undef, $r, undef) = chunksignature($_); 
           $inclusive += $r; 
           [ $inclusive, $inclusive-$r, $_ ]; 
         } 
@@ -714,14 +714,18 @@ sub inventory_host {
   open LS, "$ssh $host ls $path 2>/dev/null | cat |";
   while(<LS>){
     chomp;
-    next unless /^[0-9a-f]{1,40}\.\d+\.\d+$/; # sig.records.bytes
+    next unless chunksignature($_);
     push @files, $_;
   }
   close LS;
   return \@files;
 }
 
-
+sub chunksignature {
+  my $c = shift;
+  return undef unless m/^([a-f\d]{1,40})\.(\d+)\.(\d+)$/; # sig.records.bytes
+  return ($1, $2, $3);
+}
 
 
 
@@ -967,7 +971,7 @@ sub inventorying {
       my $host = $hostobj->[0];
       $log->(0, "locking $host for registration.\n");
       statshift('lock' => source => $host );
-      my @files = grep { m/[a-f\d]{40}\.\d+\.\d+\n$/ } 
+      my @files = grep { chunksignature($_) } 
                   `$ssh $host 'ls $source{repos}/$source{nodename} 2>/dev/null | cat'`;
       unless( @files ){
         statshift(free => source => $host );
