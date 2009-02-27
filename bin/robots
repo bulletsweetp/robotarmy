@@ -20,13 +20,13 @@
 use strict;
 no strict 'refs';
 use FileHandle;
-use Digest::SHA1 qw{ sha1_hex };
+use Digest::SHA1 qw{ sha1 sha1_hex };
 use Getopt::Long;
 use LWP::UserAgent;
 use HTTP::Request;
 use Data::Dumper;
 
-our $VERSION = 0.32;
+our $VERSION = 0.33;
 
 my $ssh = 'ssh -q -o "ConnectTimeout 1"';
 my $scp = 'scp -q -o "ConnectTimeout 1"';
@@ -525,7 +525,7 @@ sub movedata {
   for my $file (keys %$files){
     $filecount++;
     my @hosts = @{ $files->{$file} };
-    my $preflist = consistenthashring( $file, $new{hosts} );
+    my $preflist = preflist( $file, hashring(1, $new{hosts}) );
     my $attempts = 0;
     my $replicants = 0;
     for my $source (@hosts){
@@ -638,7 +638,7 @@ sub descend {
 # [replication factor] healthy hosts responsible.
 sub distribute {
   my ( $source, $destpath, $fway, $hosts ) = @_;
-  my $preflist = consistenthashring( $source, $hosts );
+  my $preflist = preflist( $source, hashring(1, $hosts));
 
   my $successes = 0;
   for my $host (@$preflist){

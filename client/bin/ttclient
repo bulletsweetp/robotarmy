@@ -24,7 +24,7 @@ use strict;
 use warnings;
 
 use FileHandle;
-use Digest::SHA1 qw{ sha1_hex };
+use Digest::SHA1 qw{ sha1 sha1_hex };
 use LWP::UserAgent;
 use HTTP::Request;
 use Getopt::Long;
@@ -344,7 +344,7 @@ sub assemble_fragments {
 # NOTE this leaves the source file where it is if appropriate
 sub distribute {
   my($seed, $src, $dest, $k, $fway, $hosts) = @_;
-  my $preflist = consistenthashring( $seed, $hosts );
+  my $preflist = preflist( $seed, hashring(1, $hosts) );
   $fway = @$hosts if (@$hosts < $fway); # can't replicate more than there are hosts
   my $owngoal = 0;
   my $thishost = $hosts->[$k];

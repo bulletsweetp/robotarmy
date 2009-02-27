@@ -1,32 +1,73 @@
 # SHARED CODE, robots+ttclient
 
-
-# return the preferred order of a consistent-hashing ring according to a key
-sub consistenthashring {
-  my ($key, $list) = @_;
-  my %seen;
-  $seen{$_}++ for @$list;
-  my $keyhash = sha1_hex($key);
-  my @hashes;
-  for my $item (keys %seen){
-    push @hashes, [ sha1_hex("$item:$_"), $item ] for (1..$seen{$item});
+# create a continuum from a list of items; make $vnodes virtual nodes per item
+sub hashring {
+  my ($vnodes, $list) = @_;
+  my @ring = ();
+  for my $item (@$list){
+    push @ring, [ sha1("$item:$_"), $item ] for (1..$vnodes);
   }
-  @hashes = sort @hashes;
-  my $keyindex = 0;
-  for (0..$#hashes){
-    next if $hashes[$_]->[0] lt $keyhash;
-    $keyindex = $_;
-    last;
-  }
-  if($keyindex != 0 and $keyindex != $#hashes){
-    @hashes = (@hashes[$keyindex .. $#hashes],
-               @hashes[0         .. $keyindex-1]);
-  }
-  %seen = ();
-  my @ring = map { $_->[1] } grep { ! $seen{$_->[1]}++ } @hashes;
+  @ring = sort { $a->[0] cmp $b->[0] } @ring;
   return \@ring;
 }
 
+# return the preferred order of items in a consistent-hashing ring according to a key
+sub preflist {
+  my ($key, $ring) = @_;
+  my $keyhash = sha1($key);
+  my @ring = @$ring;
+
+#  # dumb linear search, needs to be faster
+#  my $keyindex = 0;
+#  for (0 .. scalar(@$ring)-1){
+#    next if $ring->[$_]->[0] lt $keyhash;
+#    $keyindex = $_;
+#    last;
+#  }
+
+  my $keyindex = vnode_index($key, $ring);
+
+  # tick tock
+  my %seen = ();
+  my @pref =  map { $_->[1] } grep { ! $seen{$_->[1]}++ } @ring[$keyindex..$#ring];
+  push @pref, map { $_->[1] } grep { ! $seen{$_->[1]}++ } @ring[0..$keyindex-1]
+    if($keyindex > 0);
+
+  return \@pref;
+}
+
+# smarter search, via brad via rj
+sub vnode_index {
+  my ($key, $ring) = @_;
+  my $keyhash = sha1($key);
+
+  my $zeroval = pack("B*", '0' x 160); # "null sha1"
+  my ($lo, $hi) = (0, scalar(@$ring)-1);
+
+  while (1) {
+    my $mid           = int(($lo + $hi) / 2);
+    my $val_at_mid    = $ring->[$mid]->[0];
+    my $val_one_below = $mid ? $ring->[$mid-1]->[0] : $zeroval;
+
+    # match
+    return $mid if
+      $keyhash le $val_at_mid && $keyhash gt $val_one_below;
+
+    # wrap-around match
+    return $mid if $lo == $hi;
+
+    # too low, go up.
+    if ($val_at_mid lt $keyhash) {
+      $lo = $mid + 1;
+      $lo = $hi if $lo > $hi;
+    }
+    # too high
+    else {
+      $hi = $mid - 1;
+      $hi = $lo if $hi < $lo;
+    }
+  }
+}
 
 # STATUS SERVICE COMMUNICATIONS
 #

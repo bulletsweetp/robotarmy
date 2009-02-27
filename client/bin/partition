@@ -13,7 +13,7 @@ my ($path, $sig, $cluster) = splice @ARGV, 0, 3;
 
 my $hosts = readlist("$path/client/clusters/$cluster/.hosts");
 chomp @$hosts;
-calchashring($hosts);
+hashring(1, $hosts);
 
 my @table;
 while(<>){
@@ -39,31 +39,51 @@ exit 0;
 {
   my @ring = ();
 
-  # calculate the consistent-hashing ring
-  sub calchashring {
-    my ($list) = @_;
-    my %seen;
-    $seen{$_}++ for @$list;
-    my @hashes;
-    for my $item ( keys %seen ) {
-      push @hashes, [ unpack("N", sha1 "$item:$_"), $item ]
-        for ( 1 .. $seen{$item} );
+  # create a continuum from a list of items; make $vnodes virtual nodes per item
+  sub hashring {
+    my ($vnodes, $list) = @_;
+	my @list = @$list;
+    for my $i (0..$#list){
+      my $item = $list[$i];
+      push @ring, [ sha1("$item:$_"), $i ] for (1..$vnodes);
     }
-    @ring = sort { $a->[0] <=> $b->[0] } @hashes;
+    @ring = sort { $a->[0] cmp $b->[0] } @ring;
   }
 
-# given a key and the consistent-hash ring, return the index of the responsible slot
-  sub keyindex {
-    my ($key) = @_;
-    my $keyhash = unpack("N", sha1 $key);
-    my $keyindex = 0;
-    for ( 0 .. $#ring ) {
-      next if $ring[$_]->[0] < $keyhash;
-      $keyindex = $_;
-      last;
+#  # given a key and the consistent-hash ring, return the index of the responsible slot
+# smarter search, via brad via rj
+sub keyindex {
+  my ($key) = @_;
+  my $keyhash = sha1($key);
+
+  my $zeroval = pack("B*", '0' x 160); # "null sha1"
+  my ($lo, $hi) = (0, $#ring);
+
+  while (1) {
+    my $mid           = int(($lo + $hi) / 2);
+    my $val_at_mid    = $ring[$mid]->[0];
+    my $val_one_below = $mid ? $ring[$mid-1]->[0] : $zeroval;
+
+    # match
+    return $ring[$mid]->[1] if
+      $keyhash le $val_at_mid && $keyhash gt $val_one_below;
+
+    # wrap-around match
+    return $ring[$mid]->[1] if $lo == $hi;
+
+    # too low, go up.
+    if ($val_at_mid lt $keyhash) {
+      $lo = $mid + 1;
+      $lo = $hi if $lo > $hi;
     }
-    return $keyindex;
+    # too high
+    else {
+      $hi = $mid - 1;
+      $hi = $lo if $hi < $lo;
+    }
   }
+}
+
 }
 
 

@@ -27,6 +27,7 @@ client/err/.exists
 client/foreign/.exists
 client/log/.exists
 client/proj/.exists
+lib/shared.pl
 t/CT.t
 t/TT.t
 t/texts/odyssey.txt.gz
