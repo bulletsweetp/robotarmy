@@ -254,6 +254,8 @@ sub ttexec {
   my $err        = "$targetpath/client/err/$sig";
   $log->( 0, "source lock failed" ) unless
     statshift('lock' => source => $crew[$k])->is_success;
+  looseend('source lock', 
+            sub { register( out => [], source => $crew[$k] ) });
 
   my $pipe = "cd $conf{context}/$conf{proj}; $env $conf{mapcmd} 2>$err";
   my $chunks = seatstream( $sig, FileHandle->new("$pipe|"), \%target, $k );
@@ -405,7 +407,7 @@ sub seatstream {
   # begin a new output file
   my $startoutfile = sub {
     my $stream = (exists $conf->{uncompress} ? '' : '|gzip');
-    $outfd   = new FileHandle "$stream>$sig-out" or die $_;
+    $outfd   = new FileHandle "$stream>$sig-out" or fatal($!);
     $bytes   = 0;
     $records = 0;
   };
@@ -432,7 +434,7 @@ sub seatstream {
   $startoutfile->();
   while (<$fd>) {
     $bytes += length $_;
-    print $outfd $_;
+    print $outfd $_ or fatal($!);
     $records++;
     if ( $bytes >= $conf{chunksize} ) {
       $endoutfile->();
@@ -443,6 +445,25 @@ sub seatstream {
   return $chunks;
 }
 
+
+# loose ends list
+{
+  my %loose = ();
+  my $log;
+  sub looseend {
+    $log ||= logger("fatal error cleanup");
+    my($key, $sub) = @_;
+    $log->("registered $key for cleanup");
+    $loose{$key} = $sub;
+  }
+  sub fatal {
+    while(my($k,$s) = each %loose){
+      $log->("cleaning up $k");
+      $s->();
+    }
+    exit @_;
+  }
+}
 
 sub daemonize {
   my($machine, $cpu) = @_; 
