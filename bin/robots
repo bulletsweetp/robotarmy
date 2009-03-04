@@ -26,7 +26,7 @@ use LWP::UserAgent;
 use HTTP::Request;
 use Data::Dumper;
 
-our $VERSION = 0.33;
+our $VERSION = 0.34;
 
 my $ssh = 'ssh -q -o "ConnectTimeout 1"';
 my $scp = 'scp -q -o "ConnectTimeout 1"';
@@ -100,23 +100,6 @@ sub ctinit {
 }
 
 
-# construct a corpus type
-sub corpus {
-  my $corpus = shift;
-  my ($cluster, $name) = cluster_and_corpus($corpus);
-  my %conf;
-  if( -e "clusters/$cluster/$name" ){
-    %conf = readconf("clusters/$cluster/$name");
-  } else {
-	%conf = readconf('conf/ct.conf');
-  }
-  $conf{hosts} = readlist("clusters/$cluster/.hosts");
-  $conf{files} = readlist("clusters/$cluster/$name.files");
-  $conf{name}    = $name;
-  $conf{cluster} = $cluster;
-  return \%conf;
-}
-
 sub writecorpus {
   my %orig = %{ $_[0] };
   my %conf = %orig; # make a copy so we don't harm the original
@@ -125,26 +108,6 @@ sub writecorpus {
   delete $conf{files};
   delete $conf{hosts};
   writeconf(\%conf, "clusters/$conf{cluster}/$conf{name}");
-}
-
-
-# nail down which cluster and corpus name
-sub cluster_and_corpus {
-  my $corp = shift;
-  die "No corpus specified" unless $corp;
-  my @spec = split /\//, $corp;
-  die "cluster/corpus is malspecified: $corp" if @spec > 2;
-  if(@spec == 2){
-    die "No such cluster $spec[0]" unless -d "clusters/$spec[0]";
-    return @spec;
-  }
-  my %conf = readconf('conf/ct.conf'); 
-  return ($conf{cluster}, $corp) if -e "clusters/$conf{cluster}/$corp";
-  my @candidates = glob("clusters/*/" . quotemeta $corp);
-  return ($conf{cluster}, $corp) if @candidates == 0; # non-existent
-  die "$corp exists in multiple non-default clusters" if @candidates > 1;
-  $candidates[0] =~ s|^clusters/||;
-  return (split m|/|, $candidates[0]);
 }
 
 sub corpusexists {
