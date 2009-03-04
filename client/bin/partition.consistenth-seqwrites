@@ -1,0 +1,79 @@
+#!/usr/bin/perl -w
+use strict;
+
+use FileHandle;
+use Digest::MD5 qw( md5 );
+use constant TYPE   => 0;
+use constant KEY    => 1;
+use constant PART   => 2;
+use constant RECORD => 2;
+
+# set the input record separator
+$/ = $ENV{TTRS} if exists $ENV{TTRS};
+$/ = eval $/ if $/ =~ /^['"]/;
+
+my ($path, $sig, $cluster) = splice @ARGV, 0, 3;
+
+my $vnodes = 100;
+my $hosts = readlist("$path/client/clusters/$cluster/.hosts");
+chomp @$hosts;
+
+my @table;
+while(<>){
+  my ($key) = split /\t/;
+  next unless defined $key;
+  push @table, [ 'record', md5($key), $_ ]; 
+}
+
+for my $i ( 0 .. scalar(@$hosts)-1 ){
+  my $host = $hosts->[$i];
+  push @table, [ 'host', md5("$host:$_"), $i ] for (1..$vnodes);
+}
+
+@table = sort { $a->[KEY] cmp $b->[KEY] } @table;
+
+my %htable = ();
+my $out = '';
+for(@table){
+  if($_->[TYPE] eq 'host'){
+    if($out){
+      $htable{$_->[PART]} .= $out;
+      $out = '';
+    }
+    next;
+  }
+  $out .= $_->[RECORD];
+}
+# wraparound
+if($out){
+  $htable{'0'} .= $out;
+}
+
+while(my($part, $out) = each %htable){
+  open RECS, ">$path/parts/$part/$sig" or die $!;
+  print RECS $out;
+  close RECS;
+}
+
+exit 0;
+
+
+
+
+
+sub readlist {
+  my $fname = shift;
+  local $/ = "\n";
+  return [] unless -e $fname; 
+  my @list     = ();
+  open F, "<$fname";
+  while (<F>) {
+    chomp;
+    s/\r//;
+    next unless $_;
+    next if /^#/;
+    push @list, $_;
+  }
+  return \@list;
+}
+

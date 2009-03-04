@@ -1,0 +1,12 @@
+
+Things on the roadmap. You can help out with any of these.
+
+
+- A spiffy new retro-style logo for the Robot Army. Include the motto "E Pluribus Machina"
+
+- Create/revise documentation (Help texts in bin/robots, the Install Guide, the User Guide, the Admin Guide).
+
+- Suggest design improvements
+
+- Rewrite the partitioner to base it on a high-performance data structure like a radix trie or something. This will give at least ~20% speed improvement.
+
