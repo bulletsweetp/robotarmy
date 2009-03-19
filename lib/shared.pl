@@ -1,11 +1,11 @@
-# SHARED CODE, robots+ttclient
+# SHARED CODE, robots + ttclient
 
 # create a continuum from a list of items; make $vnodes virtual nodes per item
 sub hashring {
   my ($vnodes, $list) = @_;
   my @ring = ();
   for my $item (@$list){
-    push @ring, [ md5("$item:$_"), $item ] for (1..$vnodes);
+    push @ring, [ md5_hex("$item:$_"), $item ] for (1..$vnodes);
   }
   @ring = sort { $a->[0] cmp $b->[0] } @ring;
   return \@ring;
@@ -14,7 +14,7 @@ sub hashring {
 # return the preferred order of items in a consistent-hashing ring according to a key
 sub preflist {
   my ($key, $ring) = @_;
-  my $keyhash = md5($key);
+  my $keyhash = ($key =~ /^[a-f\d]{32}$/i) ? $key : md5_hex($key);
   my @ring = @$ring;
 
   my $keyindex = vnode_index($key, $ring);
@@ -31,9 +31,9 @@ sub preflist {
 # smarter search, via brad via rj. This screams for a radix tree.
 sub vnode_index {
   my ($key, $ring) = @_;
-  my $keyhash = md5($key);
+  my $keyhash = ($key =~ /^[a-f\d]{32}$/i) ? $key : md5_hex($key);
 
-  my $zeroval = pack("B*", '0' x 160); # "null md5"
+  my $zeroval = '0' x 32; # "null md5_hex"
   my ($lo, $hi) = (0, scalar(@$ring)-1);
 
   while (1) {
@@ -236,6 +236,7 @@ sub writelist {
 
 sub abbrev_number {
   my $n = shift;
+  return $n unless ($n =~ m|^\d+$|);
   $n =~ s/0{9}$/G/;
   $n =~ s/0{6}$/M/;
   $n =~ s/0{3}$/K/;

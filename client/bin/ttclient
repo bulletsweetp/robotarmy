@@ -70,7 +70,7 @@ sub ttmap {
     last unless @$chunk;
     my ($name, @locations) = @$chunk;
     my $file = "$source{repos}/$source{nodename}/$name";
-    my $sig = substr($name,0,40);
+    my $sig = substr( $name, 0, 32 );
     my $err = "$targetpath/client/err/$sig";
 
     unless (-e $file){
@@ -90,15 +90,19 @@ sub ttmap {
       next;
     }
 
-    my $count = seatstream($sig, FileHandle->new("<$targetpath/$sig-mapped"), \%target, $k);
+    my $count = seatstream($sig, FileHandle->new("<$targetpath/$sig-mapped"), \%target, $crew[$k]);
     unlink "$targetpath/$sig-mapped";
     unlink "foreign/$name" if -e "foreign/$name";
     my $rstat = register( out => [], in => $name );
     $log->(0, "simplemap'd and distributed $name, to $count out chunks, retired with status ". $rstat->code ."\n");
 
     my $errbytes = -s $err;
-    rename $err, "$err.1.$errbytes";
-    register('err' => [ "$sig.1.$errbytes" ]);
+    if($errbytes){
+      rename $err, "$err.1.$errbytes";
+      register('err' => [ "$sig.1.$errbytes" ]);
+	} else {
+      unlink $err;
+    }
   }
   
   $log->(0, "finished map tasks.\n");
@@ -141,7 +145,7 @@ sub mappartition {
     last unless @$chunk;
     my ( $name, @locations ) = @$chunk;
     my $file = "$source{repos}/$source{nodename}/$name";
-    my $sig = substr( $name, 0, 40 );
+    my $sig = substr( $name, 0, 32 );
     my $err = "$targetpath/client/err/$sig";
 
     unless (-e $file){
@@ -171,8 +175,12 @@ sub mappartition {
     unlink "foreign/$name" if -e "foreign/$name";
 
     my $errbytes = -s $err;
-    rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
-    register('err' => [ "$sig.1.$errbytes" ]);
+    if($errbytes){
+      rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
+      register('err' => [ "$sig.1.$errbytes" ]);
+    } else {
+      unlink $err;
+    }
   }
   $log->(0, "finished map tasks.\n");
 
@@ -217,23 +225,29 @@ sub reduce {
     my $err = "$targetpath/client/err/$part"; 
     my $pipe;
     unless($conf{nosort}){
-      die "Sort error" if system "sort -o $targetpath/$part-sorted $targetpath/parts/$part/*";
-      unlink glob("$targetpath/parts/$part/*") or warn "Problem unlinking partition $part";
+      $log->(0, "begin sorting frags of partition $part\n");
+      die "Sort error" if system "sort -m -o $targetpath/$part-sorted $targetpath/parts/$part/*";
+      $log->(0, "done sorting frags of partition $part\n");
+#      unlink glob("$targetpath/parts/$part/*") or $log->(0, "Problem unlinking partition $part\n");
       @frags = ("$targetpath/$part-sorted");
-      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $targetpath/$part-sorted | $conf{reducecmd} 2>$err |";
+      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $targetpath/$part-sorted | cut -f1 --complement | $conf{reducecmd} 2>$err |";
     } else {
       my $ins = "$targetpath/" . join " $targetpath/", @frags;
-      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $ins | $mid_rs $conf{reducecmd} 2>$err |";
+      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $ins | cut -f1 --complement | $mid_rs $conf{reducecmd} 2>$err |";
     }
 
-    my $count = seatstream($part, $pipe, \%target, $k);
+    my $count = seatparts($part, $pipe, \%target, $crew[$k]);
     unlink @frags;
     my $rstat = register(out => [], part => $part);
     $log->(0, "distributed reduction $part, to $count out chunks, retired with status ". $rstat->code  ."\n");
 
     my $errbytes = -s $err;
-    rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
-    register('err' => [ "$part.1.$errbytes" ]);
+    if($errbytes){
+      rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
+      register('err' => [ "$part.1.$errbytes" ]);
+    } else {
+      unlink $err;
+    }
   }
 
   $log->(0, "finished reduce task\n");
@@ -258,13 +272,17 @@ sub ttexec {
             sub { register( out => [], source => $crew[$k] ) });
 
   my $pipe = "cd $conf{context}/$conf{proj}; $env $conf{mapcmd} 2>$err";
-  my $chunks = seatstream( $sig, FileHandle->new("$pipe|"), \%target, $k );
+  my $chunks = seatstream( $sig, FileHandle->new("$pipe|"), \%target, $crew[$k] );
   register( 'out' => [], source => $crew[$k] );
   $log->( 0, "exec finished seating $chunks chunks.\n" );
 
   my $errbytes = -s $err;
-  rename $err, "$err.1.$errbytes";
-  register( 'err' => ["$sig.1.$errbytes"] );
+  if($errbytes){
+    rename $err, "$err.1.$errbytes";
+    register( 'err' => ["$sig.1.$errbytes"] );
+  } else {
+    unlink $err;
+  }
   $log->( 0, "finished exec task.\n" );
 }
 
@@ -343,25 +361,21 @@ sub assemble_fragments {
   return @parts;
 }
 
-# NOTE this leaves the source file where it is if appropriate
+# place a result on some responsible hosts
 sub distribute {
-  my($seed, $src, $dest, $k, $fway, $hosts) = @_;
-  my $preflist = preflist( $seed, hashring(1, $hosts) );
-  $fway = @$hosts if (@$hosts < $fway); # can't replicate more than there are hosts
-  my $owngoal = 0;
-  my $thishost = $hosts->[$k];
+  my($thishost, $file, $target) = @_;
+  my %target = %$target;
+  my $dest = "$target{repos}/$target{nodename}/$file";
   my $log = logger("$thishost distribute");
-
+  my $preflist = preflist( substr($file,0,32), hashring($target{vnodes}, $target{hosts}) );
+  
+  my $fway = $target{replicate};
+  $fway = @$preflist if (@$preflist < $fway); # can't replicate more than there are hosts
+  
   my $copies = 0;
-  for my $target (@$preflist){
+  for my $host (@$preflist){
     last if $copies >= $fway;
-    if (($target eq $thishost) and ($src eq $dest)){
-      $log->(0, "setting owngoal for copy to myself\n");
-      $owngoal = 1;
-      $copies++;
-      next;
-    }
-    my $ret = system "$scp $src $target:$dest";
+    my $ret = system "$scp $file $host:$dest";
     if($ret){
       $log->(0, "could not copy to $target (". ($ret>>8) .")\n");
     } else {
@@ -369,7 +383,7 @@ sub distribute {
       $copies++;
     }
   }
-  unlink $src unless $owngoal;
+  unlink $file;
   return undef unless $copies;
   return 1;
 }
@@ -392,17 +406,17 @@ sub fyshuffle {
 
 
 sub seatstream {
-  my ( $sig, $fd, $conf, $k ) = @_;
+  my ( $sig, $fd, $conf, $thishost ) = @_;
   my %conf = %$conf;
   my $rs   = $conf{rs};
-  my @crew = @{ $conf{hosts} };
+  my @hosts = @{ $conf{hosts} };
 
   $rs = eval $rs if ( $rs =~ /^["']/ );
   local $/ = $rs if $rs;
   my $digest = Digest::MD5->new;
   my ( $outfd, $records, $bytes );
   my $chunks = 0;
-  my $log = logger("$crew[$k] seatstream");
+  my $log = logger("$thishost seatstream");
 
   # begin a new output file
   my $startoutfile = sub {
@@ -416,18 +430,17 @@ sub seatstream {
   my $endoutfile = sub {
     $outfd->close;
     $digest->addfile( new FileHandle "<$sig-out" );
-    my $chunksig = $digest->hexdigest . ".$records.$bytes";
-    rename "$sig-out", $chunksig;
+    my $chunkname = $digest->hexdigest .".$records.$bytes";
+    rename "$sig-out", $chunkname;
     $chunks++;
     if ($bytes > 0){ 
-      distribute(hex substr($chunksig,0,8), $chunksig, 
-                 "$conf{repos}/$conf{nodename}/$chunksig", $k, $conf{replicate}, $conf{hosts});
-      my $rstat = register( out => [ $chunksig ] );
+      distribute($thishost, $chunkname, \%conf);
+      my $rstat = register( out => [ $chunkname ] );
       $log->( 0, "distributed $chunks th chunk, registered with status " . $rstat->code . "\n");
     } else { 
-      my $rstat = register( out => [ $chunksig ] );
+      my $rstat = register( out => [ $chunkname ] );
       $log->( 0, "$chunks th chunk empty, not distributing, registered with status " . $rstat->code . "\n");
-      unlink $chunksig; 
+      unlink $chunkname; 
     }
   };
 
@@ -440,6 +453,67 @@ sub seatstream {
       $endoutfile->();
       $startoutfile->();
     }
+  }
+  $endoutfile->();
+  return $chunks;
+}
+
+sub seatparts {
+  my ( $sig, $fd, $conf, $thishost ) = @_;
+  my %conf = %$conf;
+  my $rs   = $conf{rs};
+  my @hosts = @{ $conf{hosts} };
+
+  $rs = eval $rs if ( $rs =~ /^["']/ );
+  local $/ = $rs if $rs;
+  my ( $outfd, $records, $bytes );
+  my $chunks = 0;
+  my $log = logger("$thishost seatparts");
+  my @hashring = @{ hashring($conf{vnodes}, \@hosts) };
+  push @hashring, [ 'f' x 32, $hashring[0]->[1] ]; # add highest val vnode
+
+  # begin a new output file
+  my $startoutfile = sub {
+    my $stream = (exists $conf->{uncompress} ? '' : '|gzip');
+    $outfd   = new FileHandle "$stream>$sig-out" or fatal($!);
+    $bytes   = 0;
+    $records = 0;
+  };
+
+  # do this when enough has been output
+  my $endoutfile = sub {
+    $outfd->close;
+    $log->(0, "closing out vnode for host ".$hashring[0]->[1]."\n");
+    my $chunkname = $hashring[0]->[0] .".$records.$bytes";
+    rename "$sig-out", $chunkname;
+    $chunks++;
+    if ($bytes > 0){ 
+      distribute($thishost, $chunkname, \%conf);
+      my $rstat = register( out => [ $chunkname ] );
+      $log->( 0, "distributed chunk $chunks ($chunkname), registered with status " . $rstat->code . "\n");
+    } else { 
+#      my $rstat = register( out => [ $chunkname ] );
+#      $log->( 0, "$chunks th chunk empty, not distributing, registered with status " . $rstat->code . "\n");
+      unlink $chunkname; 
+    }
+  };
+
+  $startoutfile->();
+  while (<$fd>) {
+    my ($key) = (m|^([^\t]+)|);
+	$key = ($key =~ /^[a-f\d]{32}$/i) ? lc($key) : md5_hex($key);
+    fatal("Hashring somehow empty at key $key") unless @hashring;
+    if($key gt $hashring[0]->[0]){
+      $endoutfile->();
+      $startoutfile->();
+      while(@hashring and ($key gt $hashring[0]->[0])){
+        shift @hashring;
+      }
+      $log->(0, "found next vnode ".$hashring[0]->[0]." gt record $key\n");
+    }
+    $bytes += length $_;
+    print $outfd $_ or fatal($!);
+    $records++;
   }
   $endoutfile->();
   return $chunks;

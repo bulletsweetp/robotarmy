@@ -2,7 +2,7 @@
 use strict;
 
 use FileHandle;
-use Digest::MD5 qw( md5 );
+use Digest::MD5 qw( md5_hex );
 use constant TYPE   => 0;
 use constant KEY    => 1;
 use constant PART   => 2;
@@ -22,12 +22,13 @@ my @table;
 while(<>){
   my ($key) = split /\t/;
   next unless defined $key;
-  push @table, [ 'record', md5($key), $_ ]; 
+  $key = ($key =~ /^[a-f\d]{32}$/i) ? lc($key) : md5_hex($key);
+  push @table, [ 'record', $key, $_ ]; 
 }
 
 for my $i ( 0 .. scalar(@$hosts)-1 ){
   my $host = $hosts->[$i];
-  push @table, [ 'host', md5("$host:$_"), $i ] for (1..$vnodes);
+  push @table, [ 'host', md5_hex("$host:$_"), $i ] for (1..$vnodes);
 }
 
 @table = sort { $a->[KEY] cmp $b->[KEY] } @table;
@@ -42,7 +43,7 @@ for(@table){
     }
     next;
   }
-  $out .= $_->[RECORD];
+  $out .= $_->[KEY] ."\t". $_->[RECORD];
 }
 # wraparound
 if($out){
