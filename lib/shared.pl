@@ -259,35 +259,35 @@ sub expand_number {
 # construct a corpus type
 sub corpus {
   my $corpus = shift;
-  my ($cluster, $name) = cluster_and_corpus($corpus);
+  my ($ring, $name) = ring_and_corpus($corpus);
   my %conf;
-  if( -e "clusters/$cluster/$name" ){
-    %conf = readconf("clusters/$cluster/$name");
+  if( -e "clusters/$ring/$name" ){
+    %conf = readconf("clusters/$ring/$name");
   } else {
 	%conf = readconf('conf/ct.conf');
   }
-  $conf{hosts} = readlist("clusters/$cluster/.hosts");
-  $conf{files} = readlist("clusters/$cluster/$name.files");
-  $conf{name}    = $name;
-  $conf{cluster} = $cluster;
+  $conf{hosts} = readlist("clusters/$ring/.hosts");
+  $conf{files} = readlist("clusters/$ring/$name.files");
+  $conf{name}  = $name;
+  $conf{ring}  = $ring;
   return \%conf;
 }
 
 
-# nail down which cluster and corpus name
-sub cluster_and_corpus {
+# nail down which ring (cluster) and corpus name
+sub ring_and_corpus {
   my $corp = shift;
   die "No corpus specified" unless $corp;
   my @spec = split /\//, $corp;
-  die "cluster/corpus is malspecified: $corp" if @spec > 2;
+  die "ring/corpus is malspecified: $corp" if @spec > 2;
   if(@spec == 2){
-    die "No such cluster $spec[0]" unless -d "clusters/$spec[0]";
+    die "No such ring $spec[0]" unless -d "clusters/$spec[0]";
     return @spec;
   }
   my %conf = readconf('conf/ct.conf'); 
-  return ($conf{cluster}, $corp) if -e "clusters/$conf{cluster}/$corp";
+  return ($conf{ring}, $corp) if -e "clusters/$conf{ring}/$corp";
   my @candidates = glob("clusters/*/" . quotemeta $corp);
-  return ($conf{cluster}, $corp) if @candidates == 0; # non-existent
+  return ($conf{ring}, $corp) if @candidates == 0; # non-existent
   die "$corp exists in multiple non-default clusters" if @candidates > 1;
   $candidates[0] =~ s|^clusters/||;
   return (split m|/|, $candidates[0]);

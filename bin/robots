@@ -54,7 +54,7 @@ my %OPTS = (
   "maps=i"      => ar(0),  # num of procs per machine
   "nosort"      => ar(0),  # refrain from sorting - use for partition-only operations
   "partition=s" => ar(''), # substitute a different partitioner
-  "crew=s"      => ar(''), # the cluster to use for execution, if not the default
+  "crew=s"      => ar(''), # the cluster to use for execution, if not the default ring
   "context=s"   => ar(''), # path to the execution contexts
 );
 
@@ -97,7 +97,7 @@ sub ctinit {
   $conf->{replicate} = @{$conf->{hosts}} if $conf->{replicate} > @{$conf->{hosts}}; # sanity
   $conf->{nodename} = sprintf("%X", int rand(2**32)) . sprintf("%X", int rand(2**32));
   writecorpus($conf);
-  print "Created ", $conf->{cluster}, "/", $conf->{name}, "\n";
+  print "Created ", $conf->{ring}, "/", $conf->{name}, "\n";
 }
 
 
@@ -105,23 +105,23 @@ sub writecorpus {
   my %orig = %{ $_[0] };
   my %conf = %orig; # make a copy so we don't harm the original
   $conf{files} = [] unless exists $conf{files};
-  writelist("clusters/$conf{cluster}/$conf{name}.files", $conf{files});
+  writelist("clusters/$conf{ring}/$conf{name}.files", $conf{files});
   delete $conf{files};
   delete $conf{hosts};
-  writeconf(\%conf, "clusters/$conf{cluster}/$conf{name}");
+  writeconf(\%conf, "clusters/$conf{ring}/$conf{name}");
 }
 
 sub corpusexists {
   my %conf = %{ $_[0] };
-  return 1 if -e "clusters/$conf{cluster}/$conf{name}";
+  return 1 if -e "clusters/$conf{ring}/$conf{name}";
   return 0;
 }
 
 # delete the handle without touching the data. For that use ctdelete
 sub unlinkcorpus {
   my %conf = %{ $_[0] };
-  unlink "clusters/$conf{cluster}/$conf{name}";
-  unlink "clusters/$conf{cluster}/$conf{name}.files";
+  unlink "clusters/$conf{ring}/$conf{name}";
+  unlink "clusters/$conf{ring}/$conf{name}.files";
 }
 
 # add - add to a corpus from file(s), a dir, or a stream of data.
@@ -231,13 +231,13 @@ sub ctlist {
     listclusters();
   }
   s|^clusters/|| for @corpora;
-  my @headers = qw{ cluster corpus zip records bytes chunks rs };
+  my @headers = qw{ ring corpus zip records bytes chunks rs };
   my @entries = ();
   for my $path (@corpora){
-    my ($cluster, $corpus) = split m|/|, $path;
-    my $conf = corpus("$cluster/$corpus");
+    my ($ring, $corpus) = split m|/|, $path;
+    my $conf = corpus("$ring/$corpus");
     my ($chunks, $records, $bytes) = chunkmeta(%$conf);
-    push @entries, [ $cluster, $corpus, (exists $conf->{uncompress}?'':'*'), 
+    push @entries, [ $ring, $corpus, (exists $conf->{uncompress}?'':'*'), 
 	                 $records, $bytes, $chunks, $conf->{rs} ];
   }
   print "\n", scalar @corpora, " corpora:\n";
@@ -383,14 +383,14 @@ sub cttail {
 # delete a corpus or list of corpora
 sub ctdelete {
   my($conf, @rest) = @_;
-  unshift @rest, $conf->{cluster} . '/' . $conf->{name};
+  unshift @rest, $conf->{ring} . '/' . $conf->{name};
   for my $corp (@rest){
     my %conf = %{ corpus($corp) };
     next unless corpusexists(\%conf);
-    ctcmd($conf{cluster}, "rm -r $conf{repos}/$conf{nodename}") # DO NOT delete data files
+    ctcmd($conf{ring}, "rm -r $conf{repos}/$conf{nodename}") # DO NOT delete data files
       unless $conf{name} =~ /\]$/;                              # if this is a shadow corp
     # delete any shadows
-	my $name = "clusters/$conf{cluster}/$conf{name}";
+	my $name = "clusters/$conf{ring}/$conf{name}";
     for ( '', qw([in] [err] [log]) ){
       unlink "$name$_" if -e "$name$_";
 	  unlink "$name$_.files" if -e "$name$_.files";
@@ -424,7 +424,7 @@ sub ctcheck {
   my @counts;
   $counts[scalar @$_]++ for map { $inv->{$_} } keys %$inv;
 
-  print "Corpus check for $conf{cluster}/$conf{name} :\n\n";
+  print "Corpus check for $conf{ring}/$conf{name} :\n\n";
   print join('', map { "    $_ = $conf{$_}\n" } keys %conf);
   print "\nShadow corpora: ", join(", ", @shadow);
   print "\n\n";
@@ -457,14 +457,14 @@ sub ctrepair {
     if ref $failed;
 }
 
-# copy a corpus to a new corpus, using any different settings specified (eg different cluster).
+# copy a corpus to a new corpus, using any different settings specified (eg different ring).
 sub ctcopy {
   my ($old, $newcorp) = @_;
   my %old = %$old;
   my %new = %old;
-  ($new{cluster}, $new{name}) = cluster_and_corpus($newcorp);
+  ($new{ring}, $new{name}) = ring_and_corpus($newcorp);
   $new{files} = [];
-  die "Destination corpus $new{cluster}/$new{name} already exists.\n"
+  die "Destination corpus $new{ring}/$new{name} already exists.\n"
     if corpusexists(\%new);
 
   ctinit(\%new);
@@ -535,9 +535,9 @@ sub ctrename {
   my ($conf, $newname) = @_;
   my %conf = %$conf;
   die "Corpus $conf{name} not found" unless corpusexists($conf);
-  die "Usage: cluster/oldname newname" if $newname =~ m|/|;
-  rename "clusters/$conf{cluster}/$conf{name}",       "clusters/$conf{cluster}/$newname";
-  rename "clusters/$conf{cluster}/$conf{name}.files", "clusters/$conf{cluster}/$newname.files";
+  die "Usage: ring/oldname newname" if $newname =~ m|/|;
+  rename "clusters/$conf{ring}/$conf{name}",       "clusters/$conf{ring}/$newname";
+  rename "clusters/$conf{ring}/$conf{name}.files", "clusters/$conf{ring}/$newname.files";
 }
 
 # mirror the EXECUTION CONTEXT to all monkeys
@@ -706,16 +706,16 @@ sub tt {
   die usage() unless defined $target;
   die "Source corpus does not exist!" unless corpusexists( corpus($source) );
 
-  # source is an existing handle, target is created from default config with this cluster
+  # source is an existing handle, target is created from default config with this ring
   my %source = %{ corpus($source) };
   my %target = %{ corpus($target) };
   $target{rs} = $mr{rs} if exists $mr{rs};
   ctinit(\%target) unless corpusexists(\%target);
-  $mr{source}  = "$source{cluster}/$source{name}";
-  $mr{target}  = "$target{cluster}/$target{name}";
+  $mr{source}  = "$source{ring}/$source{name}";
+  $mr{target}  = "$target{ring}/$target{name}";
   $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
-  $mr{cluster} = $source{cluster};
-  $mr{crew}    = $source{cluster} unless exists $mr{crew};
+  $mr{ring}    = $source{ring};
+  $mr{crew}    = $source{ring} unless exists $mr{crew};
   $mr{statusport} = (int rand 9000) + 1999;
 
   create_sandbox(\%mr);
@@ -735,7 +735,7 @@ sub tt {
   
   die "Could not register sources" 
     unless register(source => $source{hosts} )->is_success;
-  $log->(0, "registered " . scalar @{$source{hosts}} . " sources in cluster $source{cluster}\n");
+  $log->(0, "registered " . scalar @{$source{hosts}} . " sources in ring $source{ring}\n");
   
   die "Could not register source files " 
     unless register(in => $source{files} )->is_success;
@@ -764,10 +764,10 @@ sub ttexec {
   # target is created from default config
   my %target = %{ corpus($target) };
   ctinit(\%target) unless corpusexists(\%target);
-  $mr{target}  = "$target{cluster}/$target{name}";
+  $mr{target}  = "$target{ring}/$target{name}";
   $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
-  $mr{cluster} = $target{cluster};
-  $mr{crew}    = $target{cluster} unless exists $mr{crew};
+  $mr{ring} = $target{ring};
+  $mr{crew}    = $target{ring} unless exists $mr{crew};
   $mr{statusport} = (int rand 9000) + 1999;
 
   create_sandbox(\%mr);
@@ -785,7 +785,7 @@ sub ttexec {
 
   die "Could not register hosts" 
     unless register(source => $target{hosts} )->is_success;
-  $log->(0, "registered " . scalar @{$target{hosts}} . " hosts in cluster $target{cluster}\n");
+  $log->(0, "registered " . scalar @{$target{hosts}} . " hosts in ring $target{ring}\n");
   
   execmonitor(\%mr);
   
@@ -909,11 +909,11 @@ sub clientlogshadow {
   my @crew = @{ readlist("clusters/$crew/.hosts") };
   $conf{rs} = '"\n"';
   $conf{nodename} .= '/client/log';
-  $conf{cluster} = $crew;
+  $conf{ring} = $crew;
   $conf{uncompress} = 1;
   $conf{name} .= '[log]';
   writecorpus(\%conf);
-  open CLOG, ">clusters/$conf{cluster}/$conf{name}.files" or die $!;
+  open CLOG, ">clusters/$conf{ring}/$conf{name}.files" or die $!;
   for my $machine (0..$#crew){
     printf CLOG "%020x%020x.1.0\n", $machine, $_ for 1..$maps;
   }
@@ -961,11 +961,11 @@ sub installerlauncher {
   my %task    = %$conf;
   my $log     = logger('installer-launcher');
   my %trg     = %{ corpus($task{target}) };
-  my @cluster = @{ readlist("clusters/$task{cluster}/.hosts") };
+  my @ring = @{ readlist("clusters/$task{ring}/.hosts") };
   my @crew    = @{ readlist("clusters/$task{crew}/.hosts") };
   my %crew = map { $crew[$_] => $_ } 0..$#crew;
 
-  system "$ssh $_ 'mkdir -p $trg{repos}/$trg{nodename}'" for @cluster; # sloppy
+  system "$ssh $_ 'mkdir -p $trg{repos}/$trg{nodename}'" for @ring; # sloppy
 
   return sub {
     for my $host (@crew){
@@ -1057,7 +1057,7 @@ sub output_recorder {
     return 1 unless (defined $free) and $free;
     $log->(0, "found out:[$free,$lokd] in $target{name}\n");
     my @free = object_count('out', 0); # 0 == FREE
-    open RESULT, ">>clusters/$target{cluster}/$target{name}.files" or die $!;
+    open RESULT, ">>clusters/$target{ring}/$target{name}.files" or die $!;
     for (@free){
       my $chunk = $_->[0];
       next if 
@@ -1079,7 +1079,7 @@ sub stderr_recorder {
   my %conf = %{ corpus($target) };
   $conf{rs} = '"\n"';
   $conf{nodename} .= '/client/err';
-  $conf{cluster} = $crew;
+  $conf{ring} = $crew;
   $conf{uncompress} = 1;
   $conf{name} .= '[err]';
   writecorpus(\%conf);
@@ -1089,7 +1089,7 @@ sub stderr_recorder {
     $log->(0, "found $free free 'err' objects\n") if defined $free;
     return 1 unless $free;
     my @free = object_count('err', 0); # 0 == FREE
-    open RESULT, ">>clusters/$conf{cluster}/$conf{name}.files" or die $!;
+    open RESULT, ">>clusters/$conf{ring}/$conf{name}.files" or die $!;
     for (@free){
       my $chunk = $_->[0];
       next if 
@@ -1270,7 +1270,7 @@ Usage: robots copy "old" "new" {options}
 
   Copy existing corpus, creating a new, identical corpus, using the settings 
   of the original overridden by any commandline options. If the copy is to a
-  different cluster, the corpus name can be the same.
+  different ring, the corpus name can be the same.
 
 Examples: 
   robots copy homer/corpus1 twain/corpus1
@@ -1416,10 +1416,10 @@ Examples:
 CMD
 ,
     'exec' => <<EXEC
-Usage: robots exec "cluster" /command/ "output" {options}
+Usage: robots exec "crew" /command/ "ring/output" {options}
 
-  Issue an arbitrary shell command on all hosts in "cluster", saving the 
-  results in corpus "output". DANGER! You can do a lot of damage with this 
+  Issue an arbitrary shell command on all hosts in cluster "crew", saving the 
+  results in corpus "ring/output". DANGER! You can do a lot of damage with this 
   command. The invocations are parallel, so all hosts will execute at once. 
   This is appropriate for long-running commands, or ones with large outputs 
   that you'd like to save in a corpus. Also nice for administrative tasks. The 

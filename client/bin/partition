@@ -12,10 +12,9 @@ use constant RECORD => 2;
 $/ = $ENV{TTRS} if exists $ENV{TTRS};
 $/ = eval $/ if $/ =~ /^['"]/;
 
-my ($path, $sig, $cluster) = splice @ARGV, 0, 3;
+my ($path, $sig, $ring, $vnodes) = splice @ARGV, 0, 4;
 
-my $vnodes = 100;
-my $hosts = readlist("$path/client/clusters/$cluster/.hosts");
+my $hosts = readlist("$path/client/clusters/$ring/.hosts");
 chomp @$hosts;
 
 my @table;
