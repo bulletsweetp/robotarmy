@@ -50,7 +50,6 @@ exit;
 
 
 
-
 # The simple map task.
 # 
 sub ttmap {
@@ -345,7 +344,6 @@ sub lockloop {
 sub retrieve_foreign {
   my($file, @hosts) = @_;
   for (@hosts){
-    my ($sig) = ($file =~ /\/([a-f\d]{40})\.\d+\.\d+$/);
     last unless system "$scp $_\:$file foreign/.";
   }
 }
