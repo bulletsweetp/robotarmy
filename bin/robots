@@ -19,6 +19,7 @@
 
 use strict;
 no strict 'refs';
+use DBI;
 use FileHandle;
 use Digest::MD5 qw{ md5 md5_hex };
 use Getopt::Long;
@@ -140,17 +141,19 @@ sub ctadd {
   my $digest = new Digest::MD5;
   my $RS = $conf{rs}; 
   $RS = eval $RS if ($RS =~ /^["']/);
-  my ($bytes, $records);
+  my ($db, $outhandle, $bytes, $records);
 
   my $startchunk = sub {
-    my $compress = (exists $conf{uncompress} ? '' : '|gzip');
-    open FD, "$compress>$corpsig-out";
+    $db = radschunk("$corpsig-out");
+    $outhandle = $db->prepare('insert into kv (k,v) values (?,?)');
     $bytes = 0;
     $records = 0;
   };
 
   my $endchunk = sub {
-    close FD;
+    $db->commit;
+    undef $outhandle; # hack for annoying dbd::sqlite err msg
+    $db->disconnect;
     $digest->addfile(new FileHandle "<$corpsig-out");
     my $chunksig = $digest->hexdigest . ".$records.$bytes";
     rename "$corpsig-out", $chunksig;
@@ -169,31 +172,13 @@ sub ctadd {
     }
   };
 
-  my $addfile = sub {
-    my $file = shift;
-    my $size = -s $file;
-    return unless $size;
-    open(IN, "<$file");
-    while(<IN>){
-      print FD $_;
-      $bytes += length $_;
-    }
-    close IN;
-    $records++;
-    print FD $RS; # $RS for output, $/ for input
-    $bytes += length $RS;
-    if($bytes >= $conf{chunksize}){
-      $endchunk->();
-      $startchunk->();
-    }
-  };
-
   my $addstream = sub {
     local $/ = $RS;
     while(<>){
       next unless $_;
       $bytes += length $_;
-      print FD $_;
+      s/\n$//s; # hack to compensate for sqlite's appending \n on everything
+      $outhandle->execute( md5_hex($_), $_ );
       $records++;
       if($bytes >= $conf{chunksize}){
         $endchunk->();
@@ -204,11 +189,7 @@ sub ctadd {
 
 
   $startchunk->();
-  if(@files){
-    descend( $addfile, @files );
-  } else {
-    $addstream->();
-  }
+  $addstream->();
   $endchunk->();
   writecorpus(\%conf);
   
@@ -231,13 +212,14 @@ sub ctlist {
     listclusters();
   }
   s|^clusters/|| for @corpora;
-  my @headers = qw{ ring corpus zip records bytes chunks rs };
+  my @headers = qw{ ring corpus format zip records bytes chunks rs };
   my @entries = ();
   for my $path (@corpora){
     my ($ring, $corpus) = split m|/|, $path;
     my $conf = corpus("$ring/$corpus");
     my ($chunks, $records, $bytes) = chunkmeta(%$conf);
-    push @entries, [ $ring, $corpus, (exists $conf->{uncompress}?'':'*'), 
+    push @entries, [ $ring, $corpus, $conf->{format}, 
+                     (exists $conf->{uncompress}?'':'*'), 
 	                 $records, $bytes, $chunks, $conf->{rs} ];
   }
   print "\n", scalar @corpora, " corpora:\n";
@@ -292,26 +274,48 @@ sub chunkmeta {
 
 
 sub ctrollcall {
-  die "No known_hosts file in \$ROBOTARMY/worker_dotssh\n" unless -e 'worker_dotssh/known_hosts';
+  my $cluster = shift;
 
-  system "sort worker_dotssh/known_hosts -o /tmp/known_hosts.srt";
-  system "cut -f1 -d' ' /tmp/known_hosts.srt | ssh-keyscan -t rsa -f - > /tmp/keyscanned_hosts 2>/dev/null";
-  my @changed = `sort /tmp/known_hosts.srt /tmp/keyscanned_hosts | uniq -u | cut -f1 -d' ' | uniq -d`;
-  if(@changed){
-    print "WARNING! HOST KEYS HAVE CHANGED.\n";
-    print "Reconcile the following diffs in $ENV{ROBOTARMY}/worker_dotssh/known_hosts and rerun 'robots rollcall'\n";
-    print join '', @changed;
-    unlink "/tmp/known_hosts.srt", "/tmp/keyscanned_hosts";
-    return;
+  my @hfiles;
+  if (defined $cluster and -e "clusters/$cluster/.hosts") {
+    @hfiles = ("clusters/$cluster/.hosts");
   }
-  my @missing = `sort /tmp/known_hosts.srt /tmp/keyscanned_hosts | uniq -u | cut -f1 -d' ' | uniq -u`;
-  if(@missing){
-    print "\nThe following hosts are missing:\n";
-    print join '', @missing;
-    unlink "/tmp/known_hosts.srt", "/tmp/keyscanned_hosts";
-    return;
+  else {
+    @hfiles = glob "clusters/*/.hosts";
   }
+
+  my %hosts;
+  for my $hfile (@hfiles) {
+    open HFILE, "<$hfile";
+    while (<HFILE>) {
+      next if /^#/;
+      chomp;
+      next unless $_;
+      s/^\w+\@//;
+      $hosts{$_} = 1;
+    }
+    close HFILE;
+  }
+
+  print STDERR "Gathering keys for ", scalar keys %hosts, " hosts...";
+  my $tmpfile = "/tmp/robotarmy-hosts-" . int(rand(2**31)) . int(rand(2**32)) . ".txt";
+  open TMP, ">$tmpfile";
+  print TMP join( "\n", keys %hosts ), "\n";
+  close TMP;
+
+  open KEYSCAN,
+    "cat $tmpfile | ssh-keyscan -t rsa -f - 2>/dev/null |";
+  my @found = <KEYSCAN>;
+  close KEYSCAN;
+  chomp @found;
+  s/\s.*$// for @found;
+  my %found = map { $_ => 1 } @found;
+  my @missing = grep { !exists $found{$_} } keys %hosts;
+  print "Found ", scalar @found, " hosts out of ", scalar keys %hosts, "\n";
+  print "Missing:\n", join("\n", @missing), "\n" if @missing;
+  unlink $tmpfile;
 }
+
 
 
 
@@ -349,11 +353,11 @@ sub ctslice {
                join("\n", @missing), "\n" 
                if @missing;
 
-  my $uncompress = (exists $conf{uncompress} ? '' : '| gunzip -c');
   for my $chunk (@chunks){
+    my $cat = choosestream("$conf{repos}/$conf{nodename}/$chunk", \%conf);
     my $retval = 0;
     for my $host ( @{$locations{$chunk}} ){
-      $retval = system "$ssh $host 'cat $conf{repos}/$conf{nodename}/$chunk' $uncompress";
+      $retval = system "$ssh $host \"$cat\"";
       last unless $retval;
     }
   print STDERR "Error (", ($retval>>8), ") in retrieval of file $chunk\n" if $retval;
@@ -700,8 +704,11 @@ sub tt {
   my %mr = %$mr;
   ttexec($mr, @args) && return if $mr{cmd} eq 'exec';
   my($source, $target, @extra);
-  if($mr{cmd} eq 'map'){       ($source, $mr{mapcmd},                 $target, @extra) = @args; }
   if($mr{cmd} eq 'mapreduce'){ ($source, $mr{mapcmd}, $mr{reducecmd}, $target, @extra) = @args; }
+  if($mr{cmd} eq 'map'){       ($source, $mr{mapcmd},                 $target, @extra) = @args; 
+    $mr{cmd} = 'mapreduce'; # no more simplemap!
+    $mr{reducecmd} = 'cat';
+  }
   die usage() if @extra;
   die usage() unless defined $target;
   die "Source corpus does not exist!" unless corpusexists( corpus($source) );
@@ -861,8 +868,8 @@ sub monitor {
   my $log = logger("$mr{cmd} monitor");
   clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
 
-  my @kickdata = ( kicker('in',     $mr{statusport},  5*60) );
-  push @kickdata,  kicker('part',   $mr{statusport}, 20*60) if exists $mr{reducecmd};
+  my @kickdata = ( kicker('in',     $mr{statusport},  5*60),
+                   kicker('part',   $mr{statusport}, 20*60) );
 
   my @funcs = ();
   push @funcs, inventorying($mr);
@@ -873,7 +880,7 @@ sub monitor {
   push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
 
   my $recordout = 
-    output_recorder($mr{target}, (exists $mr{reducecmd} ? 'part' : 'in'), $mr{statusport});
+    output_recorder($mr{target}, 'part', $mr{statusport});
   monitorloop($log, $recordout, @funcs);
 }
 
@@ -910,6 +917,7 @@ sub clientlogshadow {
   $conf{rs} = '"\n"';
   $conf{nodename} .= '/client/log';
   $conf{ring} = $crew;
+  $conf{format} = 'txt';
   $conf{uncompress} = 1;
   $conf{name} .= '[log]';
   writecorpus(\%conf);
@@ -1080,6 +1088,7 @@ sub stderr_recorder {
   $conf{rs} = '"\n"';
   $conf{nodename} .= '/client/err';
   $conf{ring} = $crew;
+  $conf{format} = 'txt';
   $conf{uncompress} = 1;
   $conf{name} .= '[err]';
   writecorpus(\%conf);

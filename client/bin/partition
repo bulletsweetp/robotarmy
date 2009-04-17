@@ -42,7 +42,7 @@ for(@table){
     }
     next;
   }
-  $out .= $_->[KEY] ."\t". $_->[RECORD];
+  $out .= $_->[KEY] ."\t". $_->[RECORD] . chr(0);
 }
 # wraparound
 if($out){

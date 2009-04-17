@@ -1,5 +1,14 @@
 # SHARED CODE, robots + ttclient
 
+# create a new data chunk, return opened handle to it
+sub radschunk {
+  my $name = shift;
+  my $db = DBI->connect("dbi:SQLite:dbname=$name","","", 
+                        {AutoCommit => 0}) or fatal($!);
+  $db->do("create table kv (k char(32) not null, v blob)");
+  return $db;
+}
+
 # create a continuum from a list of items; make $vnodes virtual nodes per item
 sub hashring {
   my ($vnodes, $list) = @_;
@@ -270,6 +279,7 @@ sub corpus {
   $conf{files} = readlist("clusters/$ring/$name.files");
   $conf{name}  = $name;
   $conf{ring}  = $ring;
+  $conf{format} ||= 'txt'; # back compat for flat record store
   return \%conf;
 }
 
@@ -293,6 +303,19 @@ sub ring_and_corpus {
   return (split m|/|, $candidates[0]);
 }
 
+
+
+sub choosestream {
+  my ($file, $source) = @_;
+  my %source = %$source;
+  if($source{format} eq 'kv'){
+    return "sqlite3 $file 'select v from kv'";
+  } elsif(exists $source{uncompress}){
+    return "cat $file";
+  } else {
+    return "gunzip -c $file";
+  }
+}
 
 1;
 

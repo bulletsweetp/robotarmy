@@ -24,6 +24,7 @@ use strict;
 use warnings;
 
 use FileHandle;
+use DBI;
 use Digest::MD5 qw{ md5 md5_hex };
 use LWP::UserAgent;
 use HTTP::Request;
@@ -38,7 +39,7 @@ my @args = @ARGV;
 @ARGV = ();
 my $cmd = $conf{cmd};
 die "Unknown task" unless 
-  (grep { $cmd eq $_ } qw{ map mapreduce exec });
+  (grep { $cmd eq $_ } qw{ mapreduce exec });
 
 $cmd = "tt$cmd";
 $cmd = \&$cmd;
@@ -47,65 +48,6 @@ setsvc( LWP::UserAgent->new, "http://$conf{master}:$conf{statusport}/ttstatus" )
 setlog('>&STDERR', 0);
 $cmd->(\%conf, @args);
 exit;
-
-
-
-# The simple map task.
-# 
-sub ttmap {
-  my ($conf, $k) = @_;
-  my %conf = %$conf;
-  
-  my %source = %{ corpus($conf{source}) };
-  my %target = %{ corpus($conf{target}) };
-  my @crew      = @{ readlist("clusters/$conf{crew}/.hosts") };
-  my $targetpath = "$target{repos}/$target{nodename}";
-  my $src_rs = "TTRS='$source{rs}'"; # a hint to the map cmd
-  my $log = logger("$crew[$k] ttmap");
-
-  my @localfiles = map { (m|([^/]+)$|) } glob("$source{repos}/$source{nodename}/*");
-  my $in = lockloop('in', \@localfiles); 
-  while (my $chunk = $in->()) {
-    last unless @$chunk;
-    my ($name, @locations) = @$chunk;
-    my $file = "$source{repos}/$source{nodename}/$name";
-    my $sig = substr( $name, 0, 32 );
-    my $err = "$targetpath/client/err/$sig";
-
-    unless (-e $file){
-      statshift( free => in => $name )  && next unless @locations;
-      retrieve_foreign( $file, @locations ); 
-      statshift( free => in => $name )  && next unless -e "foreign/$name";
-      $file = "$targetpath/client/foreign/$name";
-    }
-    my $stream = (exists $source{uncompress} ? 'cat' : 'gunzip -c');
-    my $pipe = "cd $conf{context}/$conf{proj}; $stream $file | $src_rs $conf{mapcmd} 2>$err > $targetpath/$sig-mapped";
-
-    my $retval = system $pipe;
-    if( $retval ){
-      $log->(0, "mapped $name with retval ". ($retval>>8) .". (Error, REVERTING)\n");
-      statshift( free => in => $name );
-      unlink "foreign/$name" if -e "foreign/$name";
-      next;
-    }
-
-    my $count = seatstream($sig, FileHandle->new("<$targetpath/$sig-mapped"), \%target, $crew[$k]);
-    unlink "$targetpath/$sig-mapped";
-    unlink "foreign/$name" if -e "foreign/$name";
-    my $rstat = register( out => [], in => $name );
-    $log->(0, "simplemap'd and distributed $name, to $count out chunks, retired with status ". $rstat->code ."\n");
-
-    my $errbytes = -s $err;
-    if($errbytes){
-      rename $err, "$err.1.$errbytes";
-      register('err' => [ "$sig.1.$errbytes" ]);
-	} else {
-      unlink $err;
-    }
-  }
-  
-  $log->(0, "finished map tasks.\n");
-}
 
 
 
@@ -131,8 +73,10 @@ sub mappartition {
   my $src_rs = "TTRS='$source{rs}'";
   my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : ''; # any RS passed is for partitioner and reducer
   my $log = logger("$crew[$k] mappartition");
+  my $bin = "$targetpath/client/bin";
   
   $conf{partition} ||= 'partition';
+
 
   unless (-d "$targetpath/parts"){
     mkdir "$targetpath/parts";
@@ -154,10 +98,10 @@ sub mappartition {
       statshift( free => in => $name )  && next unless -e "foreign/$name";
       $file = "$targetpath/client/foreign/$name";
     }
-    my $stream = (exists $source{uncompress} ? 'cat' : 'gunzip -c');
+	my $catin = choosestream($file, \%source);
     my $pipe = 
       "cd $conf{context}/$conf{proj}; " .
-      "$stream $file | $src_rs $conf{mapcmd} 2>$err | " .
+      "$catin | $src_rs $conf{mapcmd} 2>$err | " .
       "$mid_rs $targetpath/client/bin/$conf{partition} $targetpath $name $target{ring} $target{vnodes}";
 
     my $retval = system $pipe;
@@ -223,18 +167,17 @@ sub reduce {
     }
 
     my $err = "$targetpath/client/err/$part"; 
-    my $pipe;
-    unless($conf{nosort}){
-      $log->(0, "begin sorting frags of partition $part\n");
-      die "Sort error" if system "sort -m -o $targetpath/$part-sorted $targetpath/parts/$part/*";
-      $log->(0, "done sorting frags of partition $part\n");
-#      unlink glob("$targetpath/parts/$part/*") or $log->(0, "Problem unlinking partition $part\n");
-      @frags = ("$targetpath/$part-sorted");
-      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $targetpath/$part-sorted | cut -f1 --complement | $conf{reducecmd} 2>$err |";
-    } else {
-      my $ins = "$targetpath/" . join " $targetpath/", @frags;
-      $pipe = new FileHandle "cd $conf{context}/$conf{proj}; cat $ins | cut -f1 --complement | $mid_rs $conf{reducecmd} 2>$err |";
+    $log->(0, "begin concatenating frags of partition $part\n");
+#    concatfrags(FileHandle->new("cat $targetpath/parts/$part/* |"), $conf{rs}, "$targetpath/$part-sorted" );
+    if(my $ret = system "sort -m -z -o $targetpath/$part-sorted $targetpath/parts/$part/*"){
+      $log->(0, "Sort returned ". ($ret<<8) .", REVERTING partition $part\n");
+      statshift(free => part => $part);
+      next;
     }
+    $log->(0, "done concatenating frags of partition $part\n");
+    @frags = ("$targetpath/$part-sorted");
+	my $cat = "$mid_rs $targetpath/client/bin/rmnulls $targetpath/$part-sorted";
+    my $pipe = new FileHandle "cd $conf{context}/$conf{proj}; $cat | $conf{reducecmd} 2>$err |";
 
     my $count = seatparts($part, $pipe, \%target, $crew[$k]);
     unlink @frags;
@@ -376,9 +319,9 @@ sub distribute {
     last if $copies >= $fway;
     my $ret = system "$scp $file $host:$dest";
     if($ret){
-      $log->(0, "could not copy to $target (". ($ret>>8) .")\n");
+      $log->(0, "could not copy to $host (". ($ret>>8) .")\n");
     } else {
-      $log->(0, "copied to $target\n");
+      $log->(0, "copied to $host\n");
       $copies++;
     }
   }
@@ -457,6 +400,7 @@ sub seatstream {
   return $chunks;
 }
 
+
 sub seatparts {
   my ( $sig, $fd, $conf, $thishost ) = @_;
   my %conf = %$conf;
@@ -465,7 +409,7 @@ sub seatparts {
 
   $rs = eval $rs if ( $rs =~ /^["']/ );
   local $/ = $rs if $rs;
-  my ( $outfd, $records, $bytes );
+  my ( $db, $outhandle, $records, $bytes );
   my $chunks = 0;
   my $log = logger("$thishost seatparts");
   my @hashring = @{ hashring($conf{vnodes}, \@hosts) };
@@ -473,15 +417,17 @@ sub seatparts {
 
   # begin a new output file
   my $startoutfile = sub {
-    my $stream = (exists $conf->{uncompress} ? '' : '|gzip');
-    $outfd   = new FileHandle "$stream>$sig-out" or fatal($!);
+    $db = radschunk("$sig-out"); 
+    $outhandle = $db->prepare('insert into kv (k,v) values (?,?)');
     $bytes   = 0;
     $records = 0;
   };
 
   # do this when enough has been output
   my $endoutfile = sub {
-    $outfd->close;
+    $db->commit;
+    undef $outhandle;
+    $db->disconnect;
     $log->(0, "closing out vnode for host ".$hashring[0]->[1]."\n");
     my $chunkname = $hashring[0]->[0] .".$records.$bytes";
     rename "$sig-out", $chunkname;
@@ -511,7 +457,8 @@ sub seatparts {
       $log->(0, "found next vnode ".$hashring[0]->[0]." gt record $key\n");
     }
     $bytes += length $_;
-    print $outfd $_ or fatal($!);
+    s/\n$//s; # hack to compensate for sqlite3 appending \n to everything
+    $outhandle->execute($key, $_) or fatal($!);
     $records++;
   }
   $endoutfile->();

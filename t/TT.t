@@ -1,5 +1,5 @@
 
-use Test::More tests => 7;
+use Test::More tests => 3;
 
 
 # create odyssey corpus on default cluster
@@ -52,7 +52,6 @@ unlink "od-wc-test.txt", "od-wc-orig.txt" unless @difflines;
 for $corp ( qw{ odyssey odyssey_wc odyssey_uc odyssey_lines } ){
   $start = time;
   system "bin/robots delete $corp";
-  ok(!-e "corpora/$corp", "test corpus $corp deleted (".(time-$start)." secs)");
 }
 
 system "rm -rf /tmp/work-odyssey*";
