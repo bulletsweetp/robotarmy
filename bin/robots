@@ -27,7 +27,7 @@ use LWP::UserAgent;
 use HTTP::Request;
 use Data::Dumper;
 
-our $VERSION = 0.35;
+our $VERSION = 0.36;
 
 my $ssh = 'ssh -q -o "ConnectTimeout 1"';
 my $scp = 'scp -q -o "ConnectTimeout 1"';
