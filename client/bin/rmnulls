@@ -1,0 +1,14 @@
+#!/usr/bin/perl -w
+use strict;
+
+$/ = $ENV{TTRS} if exists $ENV{TTRS};
+$/ = eval $/ if ($/ =~ m/^['"]/);
+
+while(<>){
+  s/^\x00//;
+  s/^[a-f\d]{32}\t//i;
+  print;
+}
+
+
+
