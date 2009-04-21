@@ -1,0 +1,54 @@
+=head1 ABOUT THE ROBOT ARMY DATA STORE
+
+The data store for the Robot Army is:
+
+=over
+
+=item * Not a relational database (like Oracle, MySQL or Postgres)
+
+=item * Not a key/value store (like Amazon's Dynamo or Google's BigTable)
+
+=back
+
+It is instead a very simple B<flat record> store designed with B<sequential access> in mind. Records consist of blobs with no separate key and value, and are accessed and interpreted by the user commands.
+
+The data is stored in a series of chunks of a minimum size, which are replicated and distributed over machines in a cluster. Commands coordinate access to them by way of a centralized locking service, accessed via a RESTish http protocol. Commands prefer local chunks to process first, if possible.
+
+Sequential access provides for superior data throughput. It may be that there exists, or will exist in the future, some key/value store designed to have the best of both random and sequential access. Accordingly, the Robot Army is designed to be easily modified to take advantage of a separate data store.
+
+
+=head1 CORPUS DETAILS
+
+A corpus is defined with a B<corpus handle> which resides in B<clusters/clustername/> inside the Robot Army home dir. The corpus handle is simply two files named for the corpus. One contains some configuration info, and the other a list of data chunks for all the data in the corpus.
+
+For example, if a corpus is called B<odyssey> and is seated on cluster B<homer>, the handle would be comprised of the files B<odyssey> and B<odyssey.files> in the B<clusters/homer/> dir.
+
+The config info is:
+
+=over 2
+
+=item B<repos> - path to the data store dir on all participating machines
+
+=item B<replicate> - replication factor for data files
+
+=item B<chunksize> - target uncompressed size of data files
+
+=item B<rs> - corpus record separator
+
+=back
+
+The data file names consists of three parts. 
+
+=over 2
+
+=item - A 128-bit MD5 content signature in hex form
+
+=item - The number of records in the chunk
+
+=item - The size in bytes of the uncompressed chunk.
+
+=back
+
+Example: ec4980119704ff4d72fb4de2e42ed3fa.19450.256003779
+
+

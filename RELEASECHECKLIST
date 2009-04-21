@@ -1,0 +1,4 @@
+
+- edit conf/* to default values
+- generate new doc/*.pdf files if documentation has changed
+
