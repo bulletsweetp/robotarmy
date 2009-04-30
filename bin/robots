@@ -27,7 +27,7 @@ use LWP::UserAgent;
 use HTTP::Request;
 use Data::Dumper;
 
-our $VERSION = 0.36;
+our $VERSION = 0.37;
 
 my $ssh = 'ssh -q -o "ConnectTimeout 1"';
 my $scp = 'scp -q -o "ConnectTimeout 1"';
@@ -276,25 +276,14 @@ sub chunkmeta {
 sub ctrollcall {
   my $cluster = shift;
 
-  my @hfiles;
-  if (defined $cluster and -e "clusters/$cluster/.hosts") {
-    @hfiles = ("clusters/$cluster/.hosts");
-  }
-  else {
-    @hfiles = glob "clusters/*/.hosts";
-  }
-
+  my @hfiles = (defined $cluster and -e "clusters/$cluster/.hosts") ?
+               ("clusters/$cluster/.hosts") :
+               glob "clusters/*/.hosts";
   my %hosts;
   for my $hfile (@hfiles) {
-    open HFILE, "<$hfile";
-    while (<HFILE>) {
-      next if /^#/;
-      chomp;
-      next unless $_;
-      s/^\w+\@//;
-      $hosts{$_} = 1;
-    }
-    close HFILE;
+    my $h = readlist($hfile);
+    s/^\w+\@// for @$h;
+    $hosts{$_} = 1 for @$h;
   }
 
   print STDERR "Gathering keys for ", scalar keys %hosts, " hosts...";
@@ -303,13 +292,8 @@ sub ctrollcall {
   print TMP join( "\n", keys %hosts ), "\n";
   close TMP;
 
-  open KEYSCAN,
-    "cat $tmpfile | ssh-keyscan -t rsa -f - 2>/dev/null |";
-  my @found = <KEYSCAN>;
-  close KEYSCAN;
-  chomp @found;
-  s/\s.*$// for @found;
-  my %found = map { $_ => 1 } @found;
+  my @found = `cat $tmpfile | ssh-keyscan -t rsa -f - 2>/dev/null`;
+  my %found = map { chomp; s/\s.*$//; $_ => 1 } @found;
   my @missing = grep { !exists $found{$_} } keys %hosts;
   print "Found ", scalar @found, " hosts out of ", scalar keys %hosts, "\n";
   print "Missing:\n", join("\n", @missing), "\n" if @missing;
@@ -677,25 +661,6 @@ sub inventory {
   return \%files;
 }
 
-sub inventory_host {
-  my ($host, $path) = @_;
-  my @files;
-  open LS, "$ssh $host ls $path 2>/dev/null | cat |";
-  while(<LS>){
-    chomp;
-    next unless defined chunksignature($_);
-    push @files, $_;
-  }
-  close LS;
-  return \@files;
-}
-
-sub chunksignature {
-  my $c = shift;
-  return undef unless m/^([a-f\d]{1,40})\.(\d+)\.(\d+)$/; # sig.records.bytes
-  return ($1, $2, $3);
-}
-
 
 
 # MAP/MAPREDUCE distributed processing section
@@ -994,7 +959,7 @@ sub installerlauncher {
       my $i = $crew{$host};
       my $cmds = join ';', map {"perl bin/ttclient $i $_"} 1..$task{maps};
       my $ret = system "$ssh $host \'cd $trg{repos}/$trg{nodename}/client;$cmds\'";
-      $log->(0, "launched on $host with exit code " . ($ret>>8) . ".\n");
+      $log->(0, "launched on $host with exit code " .($ret>>8). ".\n");
       delete $crew{$host} unless $ret; # remove from future consideration if successful
     }
     return 0 unless %crew; # everybody finished?
@@ -1184,7 +1149,7 @@ Corpus control commands:
     
       help [command]          (print this usage list [or usage details for "command")
       list [corpus]           (list of all corpora [or detail of "corpus"])
-      rollcall                (inventories all hosts systemwide)
+      rollcall [cluster]      (inventories all hosts systemwide or of a specific cluster)
       init "corpus" {options} (create empty corpus, with options overriding defaults)
       add "corpus" ["source"] (add "source" - a file, files, or a dir - to 
                                     the corpus, treating each file as one record.

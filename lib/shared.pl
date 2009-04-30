@@ -1,4 +1,28 @@
+
+
+
 # SHARED CODE, robots + ttclient
+our $ssh = 'ssh -q -o "ConnectTimeout 1"';
+
+sub inventory_host {
+  my ($host, $path) = @_;
+  my @files;
+  open LS, "$ssh $host ls $path 2>/dev/null | cat |";
+  while(<LS>){
+    chomp;
+    next unless defined chunksignature($_);
+    push @files, $_;
+  }
+  close LS;
+  return \@files;
+}
+
+sub chunksignature {
+  my $c = shift;
+  return undef unless m/^([a-f\d]{1,40})\.(\d+)\.(\d+)$/; # sig.records.bytes
+  return ($1, $2, $3);
+}
+
 
 # create a new data chunk, return opened handle to it
 sub radschunk {
@@ -272,6 +296,7 @@ sub corpus {
   my %conf;
   if( -e "clusters/$ring/$name" ){
     %conf = readconf("clusters/$ring/$name");
+    $conf{data}  = "$conf{repos}/$conf{nodename}";
   } else {
 	%conf = readconf('conf/ct.conf');
   }
