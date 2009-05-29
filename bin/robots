@@ -21,7 +21,7 @@ use strict;
 no strict 'refs';
 use DBI;
 use FileHandle;
-use Digest::MD5 qw{ md5 md5_hex };
+use Digest::MD5 qw{ md5_hex };
 use Getopt::Long;
 use LWP::UserAgent;
 use HTTP::Request;
@@ -66,7 +66,11 @@ my ($command, @args) = @ARGV;
 @ARGV = ();
 
 
-my @commands = qw{ help list rollcall init copy add delete empty repair rename append cat head tail slice check cmd map mapreduce sync exec }; 
+my @commands = qw{ help list rollcall init 
+                   copy add delete empty 
+                   repair rename append cat 
+                   head tail slice check 
+                   cmd map mapreduce sync exec }; 
 die usage() unless $command
             and ( grep { $command eq $_ } @commands );
 
@@ -565,23 +569,23 @@ sub ctcmd {
 
 # Supporting functions
 
-# Recursively execute $code on each regular file found in 
-# the list of files/directories
-sub descend {
-  my ($code, @files) = @_;
-  
-  return unless @files;
-  while(@files){
-    my $this = shift @files;
-
-    if( -f $this ){
-      $code->($this);
-    }
-    elsif( -d $this ){
-      descend($code, glob("$this/*"));
-    }
-  }
-}
+## Recursively execute $code on each regular file found in 
+## the list of files/directories
+#sub descend {
+#  my ($code, @files) = @_;
+#  
+#  return unless @files;
+#  while(@files){
+#    my $this = shift @files;
+#
+#    if( -f $this ){
+#      $code->($this);
+#    }
+#    elsif( -d $this ){
+#      descend($code, glob("$this/*"));
+#    }
+#  }
+#}
 
 
 # distributing files
@@ -664,15 +668,21 @@ sub inventory {
 
 
 # MAP/MAPREDUCE distributed processing section
+# CLEAN UP THE BEGINNING OF THIS
 sub tt {
   my($mr, @args) = @_;
   my %mr = %$mr;
-  ttexec($mr, @args) && return if $mr{cmd} eq 'exec';
+#  ttexec($mr, @args) && return if $mr{cmd} eq 'exec';
   my($source, $target, @extra);
   if($mr{cmd} eq 'mapreduce'){ ($source, $mr{mapcmd}, $mr{reducecmd}, $target, @extra) = @args; }
-  if($mr{cmd} eq 'map'){       ($source, $mr{mapcmd},                 $target, @extra) = @args; 
-    $mr{cmd} = 'mapreduce'; # no more simplemap!
+  if($mr{cmd} eq 'map'      ){ ($source, $mr{mapcmd},                 $target, @extra) = @args; 
+    $mr{cmd} = 'mapreduce';
     $mr{reducecmd} = 'cat';
+  }
+  if($mr{cmd} eq 'exec'     ){ (         $mr{mapcmd},                 $target, @extra) = @args; 
+    $mr{cmd} = 'mapreduce';
+    $mr{reducecmd} = 'cat';
+    $source = 'ROBOTARMY-NULL-CORPUS';
   }
   die usage() if @extra;
   die usage() unless defined $target;
@@ -704,66 +714,78 @@ sub tt {
 
   # clean up on INT or DIE
   $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
-  
-  die "Could not register sources" 
-    unless register(source => $source{hosts} )->is_success;
-  $log->(0, "registered " . scalar @{$source{hosts}} . " sources in ring $source{ring}\n");
-  
-  die "Could not register source files " 
-    unless register(in => $source{files} )->is_success;
-  $log->(0, "registered " . scalar @{$source{files}} . " files in corpus $source\n");
 
+  # prepare the status service by registering tasks and corresponding tables of objects
+
+  my @tasks = qw( source target crew launch killl mappart reduce );
   my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
   die "No hosts in crew $mr{crew}" unless @crew;
-  $log->(0, "executing job spec: " . Dumper \%mr);
 
-  monitor(\%mr);
-  
-  kill TERM => `cat $mr{sandbox}/httpd.pid`;
-}
+  my @registers = (
+    [ source  => $source{hosts} ],
+    [ target  => $target{hosts} ],
+    [ mappart => $source{files} ],
+    [ crew    => \@crew         ],
+    [ task    => \@tasks        ],
+  );
 
-sub ttexec {
-  my($mr, @args) = @_;
-  my %mr = %$mr;
-  my($target, @extra);
-  ($mr{mapcmd}, $target, @extra) = @args;
-  die usage() if @extra;
-  die usage() unless defined $target;
-
-  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target.log"), $mr{loglevel});
-  my $log = logger($mr{cmd});
-
-  # target is created from default config
-  my %target = %{ corpus($target) };
-  ctinit(\%target) unless corpusexists(\%target);
-  $mr{target}  = "$target{ring}/$target{name}";
-  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
-  $mr{ring} = $target{ring};
-  $mr{crew}    = $target{ring} unless exists $mr{crew};
-  $mr{statusport} = (int rand 9000) + 1999;
-
-  create_sandbox(\%mr);
-  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
-  
-  # start server
-  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
-    my($exit, $sig) = ($err >> 8, $err & 127);
-    $log->(0, "status service failed to start: exit code $exit, sig $sig. Exiting.\n");
-    die "status server failed to start: exit code $exit, sig $sig\n";
+  for my $tab (@registers){
+    my ($table, $objects) = @$tab;
+    die "Could not register '$table' table." 
+      unless register( $table => $objects )->is_success;
+    $log->(0, "registered " . scalar @$objects . " objects in '$table' table\n");
   }
 
-  # clean up on INT or DIE
-  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
+  # lock these; robots free these tasks once the first ones are done
+  statshift( 'lock' => task => $_ ) for qw( killl reduce );
 
-  die "Could not register hosts" 
-    unless register(source => $target{hosts} )->is_success;
-  $log->(0, "registered " . scalar @{$target{hosts}} . " hosts in ring $target{ring}\n");
-  
-  execmonitor(\%mr);
-  
+  $log->(0, "executing job spec: " . Dumper \%mr);
+  monitor(\%mr);
   kill TERM => `cat $mr{sandbox}/httpd.pid`;
 }
 
+#sub ttexec {
+#  my($mr, @args) = @_;
+#  my %mr = %$mr;
+#  my($target, @extra);
+#  ($mr{mapcmd}, $target, @extra) = @args;
+#  die usage() if @extra;
+#  die usage() unless defined $target;
+#
+#  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target.log"), $mr{loglevel});
+#  my $log = logger($mr{cmd});
+#
+#  # target is created from default config
+#  my %target = %{ corpus($target) };
+#  ctinit(\%target) unless corpusexists(\%target);
+#  $mr{target}  = "$target{ring}/$target{name}";
+#  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
+#  $mr{ring} = $target{ring};
+#  $mr{crew}    = $target{ring} unless exists $mr{crew};
+#  $mr{statusport} = (int rand 9000) + 1999;
+#
+#  create_sandbox(\%mr);
+#  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
+#  
+#  # start server
+#  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
+#    my($exit, $sig) = ($err >> 8, $err & 127);
+#    $log->(0, "status service failed to start: exit code $exit, sig $sig. Exiting.\n");
+#    die "status server failed to start: exit code $exit, sig $sig\n";
+#  }
+#
+#  # clean up on INT or DIE
+#  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
+#
+#  die "Could not register hosts" 
+#    unless register(source => $target{hosts} )->is_success;
+#  $log->(0, "registered " . scalar @{$target{hosts}} . " hosts in ring $target{ring}\n");
+#  
+#  execmonitor(\%mr);
+#  
+#  kill TERM => `cat $mr{sandbox}/httpd.pid`;
+#}
+#
 
 
 
@@ -777,7 +799,7 @@ sub create_sandbox {
 
   my $client = "$mr{sandbox}/client";
   system "cp -r client $client";
-  system "cp -r clusters/*           $client/clusters/."; # a bit brutish
+  system "cp -r clusters/*           $client/clusters/."; # simple if a bit brutish
   system "cp -r conf                 $client/conf";
   system "cp -r lib                  $client/lib";
   system "cp $mr{partition}          $client/bin/." if exists $mr{partition};
@@ -829,40 +851,43 @@ EOF
 sub monitor {
   my $mr = shift;
   my %mr = %$mr;
-  $0 = "robot army $mr{cmd} monitor";
+  $0 = "robot army monitor ($mr{mapcmd})";
   my $log = logger("$mr{cmd} monitor");
   clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
 
-  my @kickdata = ( kicker('in',     $mr{statusport},  5*60),
-                   kicker('part',   $mr{statusport}, 20*60) );
+  my @kickdata = ( kicker('mappart', $mr{statusport},  5*60),
+                   kicker('reduce',  $mr{statusport}, 20*60) );
+
+  my $ret = system "cd $mr{sandbox}/client; perl bin/ttclient $mr{master} 1";
+  $log->(0, "launched master client in sandbox with code $ret\n");
 
   my @funcs = ();
-  push @funcs, inventorying($mr);
-  push @funcs, installerlauncher($mr);
+#  push @funcs, inventorying($mr);
+#  push @funcs, installerlauncher($mr);
   push @funcs, kicker('source', $mr{statusport}, 5*60);
   push @funcs, chopper(@kickdata);
   push @funcs, input_checkpointer($mr{source}, $mr{target}, $mr{statusport});
   push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
 
   my $recordout = 
-    output_recorder($mr{target}, 'part', $mr{statusport});
+    output_recorder($mr{target}, 'reduce', $mr{statusport});
   monitorloop($log, $recordout, @funcs);
 }
 
-sub execmonitor {
-  my $mr = shift;
-  my %mr = %$mr;
-  $0 = "robot army $mr{cmd} monitor";
-  my $log = logger("$mr{cmd} monitor");
-  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
-
-  my @funcs = ();
-  push @funcs, installerlauncher($mr);
-  push @funcs, stderr_recorder($mr{crew}, $mr{target}, $mr{statusport});
-
-  my $recordout = output_recorder($mr{target}, 'source', $mr{statusport});
-  monitorloop($log, $recordout, @funcs);
-}
+#sub execmonitor {
+#  my $mr = shift;
+#  my %mr = %$mr;
+#  $0 = "robot army $mr{cmd} monitor";
+#  my $log = logger("$mr{cmd} monitor");
+#  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
+#
+#  my @funcs = ();
+#  push @funcs, installerlauncher($mr);
+#  push @funcs, stderr_recorder($mr{crew}, $mr{target}, $mr{statusport});
+#
+#  my $recordout = output_recorder($mr{target}, 'source', $mr{statusport});
+#  monitorloop($log, $recordout, @funcs);
+#}
 
 sub monitorloop {
   my ($log, $final, @funcs) = @_;
@@ -887,87 +912,87 @@ sub clientlogshadow {
   $conf{name} .= '[log]';
   writecorpus(\%conf);
   open CLOG, ">clusters/$conf{ring}/$conf{name}.files" or die $!;
-  for my $machine (0..$#crew){
-    printf CLOG "%020x%020x.1.0\n", $machine, $_ for 1..$maps;
+  for my $machine (@crew){
+    print CLOG md5_hex("$machine:$_") . ".1.0\n" for 1..$maps;
   }
   close CLOG;
 }
 
-sub inventorying {
-  my($conf) = @_;
-  my %conf = %$conf;
-  my $log = logger('inventory');
-  my %source = %{ corpus($conf{source}) };
-  my %chunks = map { $_=> 1 } @{ $source{files} };
+#sub inventorying {
+#  my($conf) = @_;
+#  my %conf = %$conf;
+#  my $log = logger('inventory');
+#  my %source = %{ corpus($conf{source}) };
+#  my %chunks = map { $_=> 1 } @{ $source{files} };
+#
+#  return sub {
+#    my ($free, $locked) = object_count('source');
+#    return 0 unless $free or $locked; # all accounted for
+#    return 1 unless $free;
+#    my @free = object_count('source', 0); # 0 means 'FREE'
+#    while(@free){
+#      my $hostobj = shift @free;
+#      my $host = $hostobj->[0];
+#      $log->(0, "locking $host for registration.\n");
+#      statshift('lock' => source => $host );
+#      my @files = grep { chunksignature($_) } 
+#                  `$ssh $host 'ls $source{repos}/$source{nodename} 2>/dev/null | cat'`;
+#      unless( @files ){
+#        statshift(free => source => $host );
+#        $log->(0, "$host had no files... keeping an eye on it.\n");
+#        next;
+#      }
+#      chomp @files;
+#      @files = grep { exists $chunks{$_} } @files;
+#      $log->(0, "registering " . scalar @files . " files from $host\n");
+#      register(in => \@files, source => $host);
+#    }
+#	return 1;
+#  };
+#}
 
-  return sub {
-    my ($free, $locked) = object_count('source');
-    return 0 unless $free or $locked; # all accounted for
-    return 1 unless $free;
-    my @free = object_count('source', 0); # 0 means 'FREE'
-    while(@free){
-      my $hostobj = shift @free;
-      my $host = $hostobj->[0];
-      $log->(0, "locking $host for registration.\n");
-      statshift('lock' => source => $host );
-      my @files = grep { chunksignature($_) } 
-                  `$ssh $host 'ls $source{repos}/$source{nodename} 2>/dev/null | cat'`;
-      unless( @files ){
-        statshift(free => source => $host );
-        $log->(0, "$host had no files... keeping an eye on it.\n");
-        next;
-      }
-      chomp @files;
-      @files = grep { exists $chunks{$_} } @files;
-      $log->(0, "registering " . scalar @files . " files from $host\n");
-      register(in => \@files, source => $host);
-    }
-	return 1;
-  };
-}
 
-
-# install the environment and launch commands once per monkey. Keep checking
-# if any are unavailable at first.
-sub installerlauncher {
-  my($conf)   = @_;
-  my %task    = %$conf;
-  my $log     = logger('installer-launcher');
-  my %trg     = %{ corpus($task{target}) };
-  my @ring = @{ readlist("clusters/$task{ring}/.hosts") };
-  my @crew    = @{ readlist("clusters/$task{crew}/.hosts") };
-  my %crew = map { $crew[$_] => $_ } 0..$#crew;
-
-  system "$ssh $_ 'mkdir -p $trg{repos}/$trg{nodename}'" for @ring; # sloppy
-
-  return sub {
-    for my $host (@crew){
-      my $ret = system 
-        "$ssh $host 'rm -rf $trg{repos}/$trg{nodename}/client; mkdir -p $trg{repos}/$trg{nodename}; mkdir -p $task{context}/$task{proj}'";
-      $log->(0, "$host unresponsive, ssh returned " .($ret>>8). " - did not install.\n") && next if $ret;
-      
-	  $ret = system 
-        "$scp -r $task{sandbox}/client $host\:$trg{repos}/$trg{nodename}/client";
-      $log->(0, "installed on $host with exit code " . ($ret>>8) . ".\n");
-    
-      $ret = system
-        "$rsync $task{proj}/ $host\:$task{context}/$task{proj}";
-      $log->(0, "mirrored exec context on $host with exit code " . ($ret>>8) . ".\n");
-    }
-
-	for my $host (@crew){
-      my $i = $crew{$host};
-      my $cmds = join ';', map {"perl bin/ttclient $i $_"} 1..$task{maps};
-      my $ret = system "$ssh $host \'cd $trg{repos}/$trg{nodename}/client;$cmds\'";
-      $log->(0, "launched on $host with exit code " .($ret>>8). ".\n");
-      delete $crew{$host} unless $ret; # remove from future consideration if successful
-    }
-    return 0 unless %crew; # everybody finished?
-    @crew = keys %crew;
-	return 1;
-  };
-}
-
+## install the environment and launch commands once per monkey. Keep checking
+## if any are unavailable at first.
+#sub installerlauncher {
+#  my($conf)   = @_;
+#  my %task    = %$conf;
+#  my $log     = logger('installer-launcher');
+#  my %trg     = %{ corpus($task{target}) };
+#  my @ring = @{ readlist("clusters/$task{ring}/.hosts") };
+#  my @crew    = @{ readlist("clusters/$task{crew}/.hosts") };
+#  my %crew = map { $crew[$_] => $_ } 0..$#crew;
+#
+#  system "$ssh $_ 'mkdir -p $trg{repos}/$trg{nodename}'" for @ring; # sloppy
+#
+#  return sub {
+#    for my $host (@crew){
+#      my $ret = system 
+#        "$ssh $host 'rm -rf $trg{repos}/$trg{nodename}/client; mkdir -p $trg{repos}/$trg{nodename}; mkdir -p $task{context}/$task{proj}'";
+#      $log->(0, "$host unresponsive, ssh returned " .($ret>>8). " - did not install.\n") && next if $ret;
+#      
+#	  $ret = system 
+#        "$scp -r $task{sandbox}/client $host\:$trg{repos}/$trg{nodename}/client";
+#      $log->(0, "installed on $host with exit code " . ($ret>>8) . ".\n");
+#    
+#      $ret = system
+#        "$rsync $task{proj}/ $host\:$task{context}/$task{proj}";
+#      $log->(0, "mirrored exec context on $host with exit code " . ($ret>>8) . ".\n");
+#    }
+#
+#	for my $host (@crew){
+#      my $i = $crew{$host};
+#      my $cmds = join ';', map {"perl bin/ttclient $i $_"} 1..$task{maps};
+#      my $ret = system "$ssh $host \'cd $trg{repos}/$trg{nodename}/client;$cmds\'";
+#      $log->(0, "launched on $host with exit code " .($ret>>8). ".\n");
+#      delete $crew{$host} unless $ret; # remove from future consideration if successful
+#    }
+#    return 0 unless %crew; # everybody finished?
+#    @crew = keys %crew;
+#	return 1;
+#  };
+#}
+#
 # KICKER - produces a code ref that monitors objects of a certain type, 
 # finishing only when all have been retired. Unlocks any locked ones 
 # hanging around for more than $time seconds
@@ -978,7 +1003,7 @@ sub kicker {
   my ($free, $lokd, $rtrd, $oops) = (0,0,0,0);
 
   my $rate = sub {
-    return sprintf "%.2f/sec", $rtrd / (time - $start);
+    return sprintf "%.2f/sec", $rtrd / (time - $start + 1);
   };
 
   # monitor the locked / unlocked input chunks while there are any
@@ -1087,7 +1112,7 @@ sub input_checkpointer {
 
   my $count = 0;
   return sub {
-    my ($unlocked, $locked) = object_count('in');
+    my ($unlocked, $locked) = object_count('mappart');
     my $current = $unlocked + $locked;
     $log->(0, "found $current unfinished inputs\n");
     unless ($current){ # finish up if nothing left
@@ -1098,9 +1123,9 @@ sub input_checkpointer {
     return 1 if $current == $count;
 	$count = $current;
 
-    $log->(0, "recording $current 'in' objects in $conf{name}\n");
-    my @free = object_count('in', 0); # 0 == FREE
-    my @lokd = object_count('in', 1); # 1 == LOKD
+    $log->(0, "recording $current 'mappart' objects in $conf{name}\n");
+    my @free = object_count('mappart', 0); # 0 == FREE
+    my @lokd = object_count('mappart', 1); # 1 == LOKD
     @{$conf{files}} = map { $_->[0] } @free, @lokd;
     writecorpus(\%conf);
     return 1;

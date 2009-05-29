@@ -120,7 +120,7 @@ sub vnode_index {
         $log->( 0, "status svc has no $type objex. Sleeping". 2^$i ."seconds\n");
         sleep 2**$i++;
       } else {
-        $log->( 0, "no status svc, abandoning job, exiting (". $response->code .")\n"); 
+        $log->( 0, "no status svc at $url, abandoning job, exiting (". $response->code .")\n"); 
         die; 
       }
     }
@@ -285,8 +285,6 @@ sub expand_number {
   return $n;
 }
 
-
-# Corpus handle guesser
 
 
 # construct a corpus type

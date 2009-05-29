@@ -25,210 +25,325 @@ use warnings;
 
 use FileHandle;
 use DBI;
-use Digest::MD5 qw{ md5 md5_hex };
+use Digest::MD5 qw{ md5_hex };
 use LWP::UserAgent;
 use HTTP::Request;
-use Getopt::Long;
+#use Getopt::Long;
 use POSIX 'setsid';
 require 'lib/shared.pl';
 
-my $scp = 'scp -q -o "ConnectTimeout 3"';
+my $scp = 'scp -q -o "ConnectTimeout 1"';
+my $ssh = 'ssh -q -o "ConnectTimeout 1"';
+my $rsync = 'rsync -a';
 
 my %conf = readconf("conf/task.conf");
-my @args = @ARGV;
+my ($thishost, $cpu) = @ARGV;
 @ARGV = ();
-my $cmd = $conf{cmd};
-die "Unknown task" unless 
-  (grep { $cmd eq $_ } qw{ mapreduce exec });
-
-$cmd = "tt$cmd";
-$cmd = \&$cmd;
-daemonize( @args );
+daemonize( $thishost, $cpu );
 setsvc( LWP::UserAgent->new, "http://$conf{master}:$conf{statusport}/ttstatus" );
 setlog('>&STDERR', 0);
-$cmd->(\%conf, @args);
+
+
+my $config = init(\%conf, $thishost, $cpu);
+mainloop( %$config );
 exit;
 
 
-
-
-# map with partition, then reduce. If reduce fails, reexecute.
-sub ttmapreduce {
-  my $reduced = 0;
-  until($reduced){
-    mappartition(@_);
-    $reduced = reduce(@_);
-  }
-}
-
-sub mappartition {
-  my ( $conf, $k ) = @_;
-  my %conf = %$conf;
-
-  my %source = %{ corpus($conf{source}) };
-  my %target = %{ corpus($conf{target}) };
-  my @crew     = @{ readlist("clusters/$conf{crew}/.hosts") };
-  my @ring     = @{ readlist("clusters/$target{ring}/.hosts") };
-  my $targetpath = "$target{repos}/$target{nodename}"; 
-  my $src_rs = "TTRS='$source{rs}'";
-  my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : ''; # any RS passed is for partitioner and reducer
-  my $log = logger("$crew[$k] mappartition");
-  my $bin = "$targetpath/client/bin";
-  
-  $conf{partition} ||= 'partition';
-
-
-  unless (-d "$targetpath/parts"){
-    mkdir "$targetpath/parts";
-    mkdir "$targetpath/parts/$_" for (0..$#ring);
-  }
-  
-  my @localfiles = map { (m|([^/]+)$|) } glob("$source{repos}/$source{nodename}/*");
-  my $in = lockloop('in', \@localfiles); 
-  while ( my $chunk = $in->() ) {
-    last unless @$chunk;
-    my ( $name, @locations ) = @$chunk;
-    my $file = "$source{repos}/$source{nodename}/$name";
-    my $sig = substr( $name, 0, 32 );
-    my $err = "$targetpath/client/err/$sig";
-
-    unless (-e $file){
-      statshift( free => in => $name )  && next unless @locations;
-      retrieve_foreign( $file, @locations ); 
-      statshift( free => in => $name )  && next unless -e "foreign/$name";
-      $file = "$targetpath/client/foreign/$name";
+sub mainloop {
+  my %c = @_;
+  $c{lg}->(0, "starting with allowed tasks ". join(",",keys %{$c{priority}})."\n");
+  while(1){
+    my @tasks = freelist('task');
+    last unless @tasks;
+    @tasks = map { $_->[0] } @tasks;
+    @tasks = grep { exists $c{priority}{$_} } @tasks;
+    @tasks = sort { $c{priority}{$b} <=> $c{priority}{$a} } @tasks;
+    my $task = '';
+    while (@tasks){
+      my $t = shift @tasks;
+      my($free) = object_count($t);
+      next unless $free;
+      $task = $t;
     }
-	my $catin = choosestream($file, \%source);
-    my $pipe = 
-      "cd $conf{context}/$conf{proj}; " .
-      "$catin | $src_rs $conf{mapcmd} 2>$err | " .
-      "$mid_rs $targetpath/client/bin/$conf{partition} $targetpath $name $target{ring} $target{vnodes}";
-
-    my $retval = system $pipe;
-    if( $retval ){
-      $log->(0, "mapped $name with retval ". ($retval>>8) .". (Error, REVERTING)\n");
-      statshift( free => in => $name );
-      unlink "foreign/$name" if -e "foreign/$name";
+    unless ($task){
+      my $sleepytime = int rand(6)+1;
+      $c{lg}->(0, "no fertile tasks, sleeping $sleepytime\n");
+      sleep $sleepytime;
       next;
     }
-
-    my @parts = map { (m|/(\d+)/[^/]+$|) } glob("$targetpath/parts/*/$name");
-
-    $log->(0, "map'd $sig to ". scalar @parts ." parts\n");
-    register(part => \@parts, in => $name);
-    unlink "foreign/$name" if -e "foreign/$name";
-
-    my $errbytes = -s $err;
-    if($errbytes){
-      rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
-      register('err' => [ "$sig.1.$errbytes" ]);
-    } else {
-      unlink $err;
-    }
+    $c{lg}->(0, "executing a '$task' task\n");
+    $task = \&$task;
+    $task->(@_);
   }
-  $log->(0, "finished map tasks.\n");
+}
 
+# ready all info needed by any possible task performed
+sub init {
+  my ( $conf, $thishost, $cpu ) = @_;
+  my %conf         = %$conf;
+  my %source       = %{ corpus( $conf{source} ) };
+  my %target       = %{ corpus( $conf{target} ) };
+  my @crew         = @{ readlist("clusters/$conf{crew}/.hosts") };
+  my $context      = "$conf{context}/$conf{proj}";
+  my $localcontext = ( $conf{master} eq $thishost ) ? $conf{proj} : $context;
+
+  my %priority = ( 
+	killl   => 1,
+	launch  => 1,
+	crew    => 2,
+	target  => 3,
+    source  => 3,
+	mappart => 4, 
+	reduce  => 4, 
+  );
+
+  # if this is the master host:
+  # - just help with the infrastructure but don't execute any user code
+  # - execution context is the original, so don't prefix it with a context repos
+  if($conf{master} eq $thishost){
+    delete $priority{mappart};
+    delete $priority{reduce};
+    my $localcontext = $conf{proj};
+  }
+
+  my %c = (
+    priority     => \%priority,
+    crew         => \@crew,
+    maps         => $conf{maps},
+    thishost     => $thishost,
+    mid_rs       => ( exists $conf{rs} ? $conf{rs} : '' ),
+    context      => $context,
+    localcontext => $localcontext,
+    lg           => logger("$thishost($cpu)"),
+    mapper       => $conf{mapcmd},
+    partitioner  => ( $conf{partition} || 'partition' ),
+    localfiles   => [ map { (m|([^/]+)$|) } glob("$source{data}/*") ],
+    source       => \%source,
+    target       => \%target,
+  );
+
+  # partitions == number of crew; could change
+  unless ( -d "$c{target}{data}/parts" ) {
+    mkdir "$c{target}{data}/parts";
+    mkdir "$c{target}{data}/parts/$_" for ( 0 .. $#crew );
+  }
+  return \%c;
 }
 
 
-# For each partition, sort all files in that partition by key, 
+
+
+# inventory input data for a host
+sub source {
+  my %c = @_;
+  my $host = lockone('source', []);
+  return unless @$host;
+  $host = $host->[0];
+  my $files = inventory_host($host, $c{source}{data});
+  return unless @$files; # leave source locked, not retired, if no files
+  my %found = map {$_=>1} @$files;
+  my @files = grep { exists $found{$_} } @{ $c{source}{files} };
+  $c{lg}->(0, "registering " . scalar @files . " files from $host\n");		      
+  register(mappart => \@files, source => $host);
+}
+
+
+# prepare output area on a host
+sub target {
+  my %c = @_;
+  my $host = lockone('target', []);
+  return unless @$host;
+  $host = $host->[0];
+  my $ret = system( "ssh $host 'mkdir -p $c{target}{data}'");
+  $c{lg}->(0, "created target repository on $host with retval ".($ret>>8)."\n");
+  register( nothing => [], target => $host ) unless $ret; # leave locked if any problem
+}
+
+# install execution context and client infrastructure,
+# then register launches for the installed host
+sub crew {
+  my %c = @_;
+  my $host = lockone('crew', []);
+  return unless @$host;
+  $host = $host->[0];
+  my $ret = system
+    "$ssh $host 'rm -rf $c{target}{data}/client; mkdir -p $c{target}{data}; mkdir -p $c{context}'";
+  $c{lg}->(0, "$host unresponsive, ssh returned " .($ret>>8). ". CREW INSTALL FAILED.\n") && return if $ret;
+
+  $ret = system "$scp -r ../client $host\:$c{target}{data}/client";
+  $c{lg}->(0, "$host sandbox copy failed; ssh returned " .($ret>>8). ". CREW INSTALL FAILED.\n") && return if $ret;
+
+  $ret = system "$rsync $c{localcontext}/ $host\:$c{context}";
+  $c{lg}->(0, "$host exec context rsync failed; ssh returned " .($ret>>8). ". CREW INSTALL FAILED.\n") && return if $ret;
+ 
+  my @processes = map { "$host:$_" } (1..$c{maps});
+  register( launch => \@processes, crew => $host ); # register-and-retire
+  launch(%c); # bump a launch just for speedy propagation
+}
+
+# launch client on the specified host/context
+sub launch {
+  my %c = @_;
+  my $process = lockone('launch', []);
+  unless (@$process){
+    $c{lg}->(0, "failed to lock one for launch\n");
+    return;
+  }
+  my($host, $pid) = split /:/, $process->[0];
+  my $ret = system "$ssh $host \'cd $c{target}{data}/client; perl bin/ttclient $host $pid\'";
+  $c{lg}->(0, "launched on $host with exit code " .($ret>>8). ".\n");
+  if($ret){
+    $c{lg}->(0, "launch on $host failed. Sleeping 5 sec, REVERTING LAUNCH.\n");
+    sleep 5;
+    statshift( free => launch => $process->[0] );
+  } else {
+    register( nothing => [], launch => $process->[0] );
+  }
+}
+
+# kill user operation on the specified host
+sub killl {
+  my %c = @_;
+  my $process = lockone('killl', []);
+  return unless @$process;
+  my($host, $pid) = split /:/, $process->[0];
+  my $ret = system "$ssh $host \'cd $c{target}{data}/client; kill `cat ttclient-$pid.pid`\'";
+  $c{lg}->(0, "killed $host : $pid process with exit code " .($ret>>8). ".\n");
+  register( nothing => [], killl => $process->[0] ) unless $ret;
+  statshift( free => killl => $process->[0] ) if $ret;
+}
+
+
+## map and partition
+sub mappart {
+  my %c = @_;
+  my $chunk = lockone( 'mappart', $c{localfiles} );
+  return unless @$chunk;
+  my ( $name, @locations ) = @$chunk;
+  my $file = "$c{source}{data}/$name";
+  my $id   = substr( $name, 0, 32 );
+  my $err  = "$c{target}{data}/client/err/$id";
+
+  unless ( -e $file ) {
+    retrieve_foreign( $file, @locations );
+    statshift( free => mappart => $name ) && return unless -e "foreign/$name";
+    $file = "$c{target}{data}/client/foreign/$name";
+  }
+
+  my $catin  = choosestream( $file, $c{source} );
+  my $src_rs = "TTRS='$c{source}{rs}'";
+  my $mid_rs = exists $c{mid_rs} ? "TTRS='$c{mid_rs}'" : '';
+  my $pipe   =
+      "cd $c{context}; "
+    . "$catin | $src_rs $c{mapper} 2>$err | "
+    . "$mid_rs $c{target}{data}/client/bin/$c{partitioner} $c{target}{data} $name $c{target}{ring} $c{target}{vnodes}";
+
+  my $ret = system $pipe;
+  if ($ret) {
+    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ". (Error, REVERTING MAPPART)\n" );
+    statshift( free => mappart => $name );
+    unlink "foreign/$name" if -e "foreign/$name";
+    next;
+  }
+
+  my @parts = map { (m|/(\d+)/[^/]+$|) } glob("$c{target}{data}/parts/*/$name");
+  $c{lg}->( 0, "map'd $id to " . scalar @parts . " parts\n" );
+  register( reduce => \@parts, mappart => $name );
+  unlink "foreign/$name" if -e "foreign/$name";
+  register_errchunk( $err, $id );
+  bump_reduce_table($c{lg});
+}
+
+# check to see if all mappart entries are finished. 
+# If so, unlock the reduce table.
+sub bump_reduce_table {
+  my $log = shift;
+  my($free,$locked) = object_count('mappart');
+  unless($free+$locked){
+    $log->(0, "no unfinished 'mappart', time to unlock reduce table\n");
+    my $ret = statshift( free => task => 'reduce' )->is_success;
+    $log->(0, "unlock of reduce task returned $ret\n");
+  }
+}
+
+# reduce: For each partition, sort all files in that partition by key, 
 # and pipe through the reduce program to a series of segmented
 # result files.
 sub reduce {
-  my ($conf, $k) = @_;
-  my %conf = %$conf;
+  my %c = @_;
+  my $partobj = lockone( 'reduce', [] );
+  return unless @$partobj;
+  my ( $part, @sources ) = @$partobj;
+  $c{lg}->( 0, "locked partition $part\n" );
 
-  my %target     = %{ corpus($conf{target}) };
-  my @crew       = @{ readlist("clusters/$conf{crew}/.hosts") };
-  my $targetpath = "$target{repos}/$target{nodename}";
-  my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : ''; # any RS passed is for partitioner and reducer
-  my $log = logger("$crew[$k] reduce");
+  my @frags = assemble_fragments( "$c{target}{data}/parts", $part, $c{crew} );
+  $c{lg}->( 0, "got " . scalar @frags . " frags from partition $part.\n" );
+  statshift( free => reduce => $part ) && next unless @frags;
 
-  $log->(0, "NOT sorting.\n") if $conf{nosort};
-
-  my @results;
-  my $parts = lockloop('part');
-  while(my $partobj = $parts->()){
-    last unless @$partobj;
-    my ($part, @sources) = @$partobj;
-    $log->(0, "locked partition $part\n");
-
-    my @frags = assemble_fragments("$targetpath/parts", $part, $k, \@crew);
-    $log->(0, "got ". scalar @frags ." frags from partition $part.\n");
-    statshift(free => part => $part) && next unless @frags;
-
-    # verify all fragments are present for this partition
-    my ($missing, $extra) = compare_sets(\@sources, \@frags);
-    if(@$missing){
-      $log->(0, scalar @$missing ." fragments missing from partition $part, skipping.\n");
-      statshift( free => part => $part );
-      statshift( free => in   => $_ ) for @$missing;
-      return 0; # reexecute the map phase
-    }
-
-    my $err = "$targetpath/client/err/$part"; 
-    $log->(0, "begin concatenating frags of partition $part\n");
-#    concatfrags(FileHandle->new("cat $targetpath/parts/$part/* |"), $conf{rs}, "$targetpath/$part-sorted" );
-    if(my $ret = system "sort -m -z -o $targetpath/$part-sorted $targetpath/parts/$part/*"){
-      $log->(0, "Sort returned ". ($ret<<8) .", REVERTING partition $part\n");
-      statshift(free => part => $part);
-      next;
-    }
-    $log->(0, "done concatenating frags of partition $part\n");
-    @frags = ("$targetpath/$part-sorted");
-	my $cat = "$mid_rs $targetpath/client/bin/rmnulls $targetpath/$part-sorted";
-    my $pipe = new FileHandle "cd $conf{context}/$conf{proj}; $cat | $conf{reducecmd} 2>$err |";
-
-    my $count = seatparts($part, $pipe, \%target, $crew[$k]);
-    unlink @frags;
-    my $rstat = register(out => [], part => $part);
-    $log->(0, "distributed reduction $part, to $count out chunks, retired with status ". $rstat->code  ."\n");
-
-    my $errbytes = -s $err;
-    if($errbytes){
-      rename $err, "$err.1.$errbytes"; # undefined RS so one record per chunk
-      register('err' => [ "$part.1.$errbytes" ]);
-    } else {
-      unlink $err;
-    }
+  # verify all fragments are present for this partition
+  my ( $missing, $extra ) = compare_sets( \@sources, \@frags );
+  if (@$missing) {
+    $c{lg}->( 0, scalar @$missing . " fragments missing from partition $part, skipping.\n");
+    statshift( free => reduce => $part );
+    statshift( free => mappart => $_ ) for @$missing;
+    return 0;    # reexecute the map phase
   }
 
-  $log->(0, "finished reduce task\n");
-  return 1;
+  my $err = "$c{target}{data}/client/err/$part";
+  $c{lg}->( 0, "begin concatenating frags of partition $part\n" );
+  if ( my $ret = system "sort -m -z -o $c{target}{data}/$part-sorted $c{target}{data}/parts/$part/*"){
+    $c{lg}->( 0, "Sort returned ".($ret>>8).", REVERTING partition $part\n");
+    statshift( free => reduce => $part );
+    next;
+  }
+  $c{lg}->( 0, "done concatenating frags of partition $part\n" );
+  @frags = ("$c{target}{data}/$part-sorted");
+  my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : '';
+  my $cat = "$mid_rs $c{target}{data}/client/bin/rmnulls $c{target}{data}/$part-sorted";
+  my $pipe = new FileHandle
+    "cd $conf{context}/$conf{proj}; $cat | $conf{reducecmd} 2>$err |";
+
+  my $count = seatparts( $part, $pipe, $c{target}, $c{thishost} );
+  unlink @frags;
+  register_errchunk( $err, $part ); # do this before master can exit
+  my $rstat = register( out => [], reduce => $part );
+  $c{lg}->( 0, "distributed reduction $part, to $count out chunks, retired with status ".$rstat->code."\n");
 }
 
 
-sub ttexec {
-  my ( $conf, $k ) = @_;
-  my %conf = %$conf;
+# Execute: mappart with no input corpus (DEPRECATED)
+sub execute {
+  my $c   = shift;
+  my %c   = %$c;
+  my $env = "TTRS='$c{target}{rs}' TTHOST=$c{thishost}";
+  my $id  = md5_hex( $c{thishost} );
+  my $err = "$c{target}{data}/client/err/$id";
+  $c{lg}->( 0, "source lock failed" )
+    unless statshift( 'lock' => execute => $c{thishost} )->is_success;
+  looseend( 'source lock',
+    sub { register( out => [], source => $c{thishost} ) } );
 
-  my %target     = %{ corpus( $conf{target} ) };
-  my @crew       = @{ $target{hosts} };
-  my $targetpath = "$target{repos}/$target{nodename}";
-  my $log        = logger("$crew[$k] exec");
-  my $env        = "TTRS='$target{rs}' TTHOST=$k";
-  my $sig        = md5_hex($crew[$k]);
-  my $err        = "$targetpath/client/err/$sig";
-  $log->( 0, "source lock failed" ) unless
-    statshift('lock' => source => $crew[$k])->is_success;
-  looseend('source lock', 
-            sub { register( out => [], source => $crew[$k] ) });
+  my $pipe   = "cd $c{context}; $env $conf{mapper} 2>$err";
+  my $chunks =
+    seatstream( $id, FileHandle->new("$pipe|"), $c{target}, $c{thishost} );
+  register( 'out' => [], source => $c{thishost} );
+  $c{lg}->( 0, "exec finished seating $chunks chunks.\n" );
 
-  my $pipe = "cd $conf{context}/$conf{proj}; $env $conf{mapcmd} 2>$err";
-  my $chunks = seatstream( $sig, FileHandle->new("$pipe|"), \%target, $crew[$k] );
-  register( 'out' => [], source => $crew[$k] );
-  $log->( 0, "exec finished seating $chunks chunks.\n" );
+  register_errchunk( $err, $id );
+  $c{lg}->( 0, "finished exec task.\n" );
+}
 
-  my $errbytes = -s $err;
+
+sub register_errchunk {
+  my ($errfile, $id) = @_;
+  my $errbytes = -s $errfile;
   if($errbytes){
-    rename $err, "$err.1.$errbytes";
-    register( 'err' => ["$sig.1.$errbytes"] );
+    rename $errfile, "$errfile.1.$errbytes"; # one record per chunk
+    register('err' => [ "$id.1.$errbytes" ]);
   } else {
-    unlink $err;
+    unlink $errfile;
   }
-  $log->( 0, "finished exec task.\n" );
 }
-
 
 sub compare_sets {
   my($left, $right) = @_;
@@ -247,39 +362,48 @@ sub compare_sets {
 }
 
 
-# returns an iterator for objects of the given type, starting with 
-# a given list of object ids. Each object returned is garuanteed to
-# be locked. Blocks until it can provide a locked object. Returns an 
-# empty list ref when objects are no longer available.
-sub lockloop {
-  my ($type, $list) = @_;
-  my @free = ();
-  @free = map { [ $_ ] } @$list if defined $list;
-  my $log = logger("lockloop on $type");
+# return a list of free $type items, 
+# block until there are free items,
+# return empty when there are no free or locked items.
+sub freelist {
+  my $type = shift;
+  my $log = logger("freelist on $type");
+  my $sleepytime = 0;
 
-  return sub {
-    while(1){
-      while(@free){
-        my $obj = shift @free;
-        next unless statshift('lock' => $type => $obj->[0])->is_success;
-        return $obj;
-      }
-      my $sleepytime = 0;
-      while(1){
-        my($free,$locked) = object_count($type);
-        $log->(0, "$free free / $locked locked objex, exiting lockloop\n") && return [] 
-          unless $free or $locked;
-        if($free){
-          $log->(0, "$free free / $locked locked objex\n");
-          @free = object_count($type, 0); # zero means status "FREE"
-          last;
-        }
-        $log->(0, "$free free / $locked locked objex, sleeping ". 2**$sleepytime ." seconds\n");
-        sleep $sleepytime**2;
-        $sleepytime++ unless $sleepytime >= 2; # 4 seconds to sleep, max
-      }
+  while (1) {
+    my ( $free, $locked ) = object_count($type);
+    $log->(0, "no '$type' objex, exiting freelist\n") && return () 
+      unless $free or $locked;
+    if ($free) {
+      $log->( 0, "$free free / $locked locked '$type' objex\n" );
+      my @free = object_count( $type, 0 );    # zero means status "FREE"
+      return @free if @free;
     }
-  };
+    $log->( 0, "$free free / $locked locked objex, sleeping " . 2**$sleepytime . " seconds\n");
+    sleep $sleepytime**2;
+    $sleepytime++ unless $sleepytime >= 3;    # 8 seconds to sleep, max
+  }
+}
+
+# lock a single item,
+# return empty if there are no free available,
+# prefer items from $list
+sub lockone {
+  my ($type, $local) = @_;
+  my ($free) = object_count($type);
+  return [] unless $free;
+  while(@$local){
+    my $name = shift @$local;
+    next unless statshift('lock' => $type => $name)->is_success;
+    return [ $name ];
+  }
+  my @free = object_count($type, 0);
+  while(@free){
+    my $obj = shift @free;
+    next unless statshift('lock' => $type => $obj->[0])->is_success;
+    return $obj;
+  }
+  return []; 
 }
 
 
@@ -293,7 +417,7 @@ sub retrieve_foreign {
 
 # gather fragments from hosts in randomized order
 sub assemble_fragments {
-  my ( $dir, $part, $thishost, $hosts ) = @_;
+  my ( $dir, $part, $hosts ) = @_;
   my @hosts = @$hosts;
   my $ihosts = fyshuffle( $part, scalar @hosts );
   for my $i (@$ihosts) {
@@ -488,11 +612,12 @@ sub seatparts {
 sub daemonize {
   my($machine, $cpu) = @_; 
   open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
-  my $logname = sprintf "%020x%020x.1.0", $machine, $cpu;
+  my $logname = md5_hex("$machine:$cpu") . ".1.0";
   open STDOUT, ">log/$logname" or die "Can't write to client/log: $!";
   defined(my $pid = fork) or die "Can't fork: $!";
   exit if $pid;
   setsid                  or die "Can't start a new session: $!";
   open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+  $|=1; # unbuffer 
 }
 
