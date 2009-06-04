@@ -47,13 +47,13 @@ my %OPTS = (
   "uncompress"  => ar(0),        # compression is on by default
 
   # Corpus Tool opts 
+  "format=s"    => ar(''),
   "repos=s"     => ar(''),       # path to the data repositories
   "chunksize=s" => ar(''),       # uncompressed file chunk target size
   "vnodes=i"    => ar(0),        # number of virtual nodes per corpus host
 
   # TransTabulator opts
   "maps=i"      => ar(0),  # num of procs per machine
-  "nosort"      => ar(0),  # refrain from sorting - use for partition-only operations
   "partition=s" => ar(''), # substitute a different partitioner
   "crew=s"      => ar(''), # the cluster to use for execution, if not the default ring
   "context=s"   => ar(''), # path to the execution contexts
@@ -69,7 +69,7 @@ my ($command, @args) = @ARGV;
 my @commands = qw{ help list rollcall init 
                    copy add delete empty 
                    repair rename append cat 
-                   head tail slice check 
+                   head tail slice check df
                    cmd map mapreduce sync exec }; 
 die usage() unless $command
             and ( grep { $command eq $_ } @commands );
@@ -83,7 +83,7 @@ if( grep { $command eq $_ } qw{ map mapreduce exec }){
 } else {
   $args[0] = corpus($args[0]) 
     if @args # predetermine specifics of a corpus
-    and not grep { $command eq $_ } qw{ help sync cmd rollcall }; # except for these
+    and not grep { $command eq $_ } qw{ help sync cmd rollcall df }; # except for these
   $command = "ct$command";
   $command = \&$command;
   $command->(@args);
@@ -129,35 +129,33 @@ sub unlinkcorpus {
   unlink "clusters/$conf{ring}/$conf{name}.files";
 }
 
-# add - add to a corpus from file(s), a dir, or a stream of data.
+# add - add to a flat record corpus from a stream of data.
 #
 #  - splits the input into sizes of not less than the target chunksize
 #  - names the chunks according to a content signature
 #  - distributes the chunks to the responsible hosts
 #  - writes/updates the corpus handle file list [corpus].files
-
 sub ctadd {
-  my ($conf, @files) = @_;
+  my ($conf) = @_;
   my %conf = %$conf;
+  die "Corpus format must be txt to add" if $conf{format} ne 'txt';
   die "Cannot add to shadow corpus" if $conf{name} =~ /\]$/;
   die "Corpus not found." unless corpusexists($conf);
   my $corpsig = md5_hex($conf{name}); # get a symbol to use locally
   my $digest = new Digest::MD5;
   my $RS = $conf{rs}; 
   $RS = eval $RS if ($RS =~ /^["']/);
-  my ($db, $outhandle, $bytes, $records);
+  my ($bytes, $records);
 
   my $startchunk = sub {
-    $db = radschunk("$corpsig-out");
-    $outhandle = $db->prepare('insert into kv (k,v) values (?,?)');
+    my $compress = (exists $conf{uncompress} ? '' : '|gzip');
+    open FD, "$compress>$corpsig-out";
     $bytes = 0;
     $records = 0;
   };
 
   my $endchunk = sub {
-    $db->commit;
-    undef $outhandle; # hack for annoying dbd::sqlite err msg
-    $db->disconnect;
+    close FD;
     $digest->addfile(new FileHandle "<$corpsig-out");
     my $chunksig = $digest->hexdigest . ".$records.$bytes";
     rename "$corpsig-out", $chunksig;
@@ -176,21 +174,21 @@ sub ctadd {
     }
   };
 
+  # if an additional record would result in >chunksize length, 
+  # finish off current chunk
   my $addstream = sub {
     local $/ = $RS;
     while(<>){
       next unless $_;
-      $bytes += length $_;
-      s/\n$//s; # hack to compensate for sqlite's appending \n on everything
-      $outhandle->execute( md5_hex($_), $_ );
-      $records++;
-      if($bytes >= $conf{chunksize}){
+      if($bytes and (($bytes + length $_) > $conf{chunksize})){
         $endchunk->();
         $startchunk->();
       }
+      $bytes += length $_;
+      print FD $_;
+      $records++;
     }
   };
-
 
   $startchunk->();
   $addstream->();
@@ -199,7 +197,6 @@ sub ctadd {
   
   cleanupkids();
 }
-
 
 
 
@@ -342,7 +339,7 @@ sub ctslice {
                if @missing;
 
   for my $chunk (@chunks){
-    my $cat = choosestream("$conf{repos}/$conf{nodename}/$chunk", \%conf);
+    my $cat = choosestream("$conf{repos}/$conf{nodename}/$chunk", \%conf, "$conf{repos}/$conf{nodename}/client/bin/valuethaw");
     my $retval = 0;
     for my $host ( @{$locations{$chunk}} ){
       $retval = system "$ssh $host \"$cat\"";
@@ -379,11 +376,12 @@ sub ctdelete {
   for my $corp (@rest){
     my %conf = %{ corpus($corp) };
     next unless corpusexists(\%conf);
-    ctcmd($conf{ring}, "rm -r $conf{repos}/$conf{nodename}") # DO NOT delete data files
-      unless $conf{name} =~ /\]$/;                              # if this is a shadow corp
+    ctcmd($conf{ring}, "rm -r $conf{repos}/$conf{nodename}");
+    ctcmd($conf{crew}, "rm -r $conf{repos}/$conf{nodename}") if exists $conf{crew};
+
     # delete any shadows
 	my $name = "clusters/$conf{ring}/$conf{name}";
-    for ( '', qw([in] [err] [log]) ){
+    for ( '', qw([input] [err] [log]) ){
       unlink "$name$_" if -e "$name$_";
 	  unlink "$name$_.files" if -e "$name$_.files";
     }	
@@ -456,6 +454,7 @@ sub ctcopy {
   my %new = %old;
   ($new{ring}, $new{name}) = ring_and_corpus($newcorp);
   $new{files} = [];
+  $new{vnodes} ||= 5;
   die "Destination corpus $new{ring}/$new{name} already exists.\n"
     if corpusexists(\%new);
 
@@ -508,6 +507,8 @@ sub ctappend {
   my %new = %{ corpus($newcorp) };
   my %old = %$old;
   die "Cannot append to shadow corpus" if ($old{name} =~ /\]$/) or ($new{name} =~ /\]$/);
+  die "Cannot append to key-value corpus" if $new{format} eq 'kv';
+  die "Cannot append key-value corpus"    if $old{format} eq 'kv';
   die "No corpus handle found for $newcorp\n" unless corpusexists(\%new);
   die "No data to copy!\n" unless @{$old{files}};
 
@@ -665,25 +666,94 @@ sub inventory {
   return \%files;
 }
 
+# convenient diskfree
+sub ctdf {
+  my($ring) = @_;
+  my $h = readlist("clusters/$ring/.hosts");
+  my @lines;
+  for my $host ( @$h ){
+    my @line = `$ssh $host df -m`;
+    push @lines, $line[1];
+    print $line[1];
+  }
+  my ($total, $used, $avail) = (0,0);
+  for (@lines){
+    my @fields = split /\s+/;
+	$total += $fields[1];
+	$used  += $fields[2];
+	$avail += $fields[3];
+  }
+  print "\n$ring:\nMB Total[$total] Used[$used] Available[$avail]\n";
+}
+
 
 
 # MAP/MAPREDUCE distributed processing section
-# CLEAN UP THE BEGINNING OF THIS
+# Could use a refactor, too much repetition
 sub tt {
   my($mr, @args) = @_;
+  ttexec(@_)      if $mr->{cmd} eq 'exec';
+  ttmap(@_)       if $mr->{cmd} eq 'map';
+  ttmapreduce(@_) if $mr->{cmd} eq 'mapreduce';
+}
+
+sub ttexec {
+  my($mr, @args) = @_;
   my %mr = %$mr;
-#  ttexec($mr, @args) && return if $mr{cmd} eq 'exec';
   my($source, $target, @extra);
-  if($mr{cmd} eq 'mapreduce'){ ($source, $mr{mapcmd}, $mr{reducecmd}, $target, @extra) = @args; }
-  if($mr{cmd} eq 'map'      ){ ($source, $mr{mapcmd},                 $target, @extra) = @args; 
-    $mr{cmd} = 'mapreduce';
-    $mr{reducecmd} = 'cat';
+  ($mr{mapcmd}, $target, @extra) = @args; 
+  die usage() if @extra;
+  die usage() unless defined $target;
+
+  # target is created from default config with this ring
+  my %target = %{ corpus($target) };
+  $target{rs}   = $mr{rs}   if exists $mr{rs};
+  $target{crew} = $mr{crew} if exists $mr{crew};
+  ctinit(\%target) unless corpusexists(\%target);
+  die "Can't produce key-value corpus without mapreduce operation" 
+    if $target{format} eq 'kv';
+  $mr{target}  = "$target{ring}/$target{name}";
+  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
+  $mr{ring}    = $target{ring};
+  $mr{crew}    = $target{ring} unless exists $mr{crew};
+  $mr{statusport} = (int rand 9000) + 1999;
+
+  startservices($target{name}, %mr);
+  my $log = logger($mr{cmd});
+
+  # prepare the status service by registering tasks and corresponding tables of objects
+  my @tasks = qw( execute target crew launch killl );
+  my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
+  die "No hosts in crew $mr{crew}" unless @crew;
+  my @registers = (
+    [ execute  => \@crew        ],
+    [ target  => $target{hosts} ],
+    [ crew    => \@crew         ],
+    [ task    => \@tasks        ],
+  );
+
+  for my $tab (@registers){
+    my ($table, $objects) = @$tab;
+    die "Could not register '$table' table." 
+      unless register( $table => $objects )->is_success;
+    $log->(0, "registered " . scalar @$objects . " objects in '$table' table\n");
   }
-  if($mr{cmd} eq 'exec'     ){ (         $mr{mapcmd},                 $target, @extra) = @args; 
-    $mr{cmd} = 'mapreduce';
-    $mr{reducecmd} = 'cat';
-    $source = 'ROBOTARMY-NULL-CORPUS';
-  }
+
+  # lock kill table
+  statshift( 'lock' => task => $_ ) for qw( killl );
+
+  $log->(0, "executing job spec: " . Dumper \%mr);
+  execmonitor(\%mr);
+  kill TERM => `cat $mr{sandbox}/httpd.pid`;
+}
+
+
+
+sub ttmap {
+  my($mr, @args) = @_;
+  my %mr = %$mr;
+  my($source, $target, @extra);
+  ($source, $mr{mapcmd}, $target, @extra) = @args; 
   die usage() if @extra;
   die usage() unless defined $target;
   die "Source corpus does not exist!" unless corpusexists( corpus($source) );
@@ -691,7 +761,62 @@ sub tt {
   # source is an existing handle, target is created from default config with this ring
   my %source = %{ corpus($source) };
   my %target = %{ corpus($target) };
-  $target{rs} = $mr{rs} if exists $mr{rs};
+  $target{rs}   = $mr{rs}   if exists $mr{rs};
+  $target{crew} = $mr{crew} if exists $mr{crew};
+  ctinit(\%target) unless corpusexists(\%target);
+  die "Can't produce key-value corpus without mapreduce operation" 
+    if $target{format} eq 'kv';
+  $mr{source}  = "$source{ring}/$source{name}";
+  $mr{target}  = "$target{ring}/$target{name}";
+  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
+  $mr{ring}    = $source{ring};
+  $mr{crew}    = $source{ring} unless exists $mr{crew};
+  $mr{statusport} = (int rand 9000) + 1999;
+
+  startservices($target{name}, %mr);
+  my $log = logger($mr{cmd});
+
+  # prepare the status service by registering tasks and corresponding tables of objects
+  my @tasks = qw( justmapsrc target crew launch killl justmap );
+  my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
+  die "No hosts in crew $mr{crew}" unless @crew;
+  my @registers = (
+    [ justmapsrc  => $source{hosts} ],
+    [ target      => $target{hosts} ],
+    [ justmap     => $source{files} ],
+    [ crew        => \@crew         ],
+    [ task        => \@tasks        ],
+  );
+
+  for my $tab (@registers){
+    my ($table, $objects) = @$tab;
+    die "Could not register '$table' table." 
+      unless register( $table => $objects )->is_success;
+    $log->(0, "registered " . scalar @$objects . " objects in '$table' table\n");
+  }
+
+  # lock these; robots free these tasks once the first ones are done
+  statshift( 'lock' => task => $_ ) for qw( killl );
+
+  $log->(0, "executing job spec: " . Dumper \%mr);
+  mapmonitor(\%mr);
+  kill TERM => `cat $mr{sandbox}/httpd.pid`;
+}
+
+sub ttmapreduce {
+  my($mr, @args) = @_;
+  my %mr = %$mr;
+  my($source, $target, @extra);
+  ($source, $mr{mapcmd}, $mr{reducecmd}, $target, @extra) = @args;
+  die usage() if @extra;
+  die usage() unless defined $target;
+  die "Source corpus does not exist!" unless corpusexists( corpus($source) );
+
+  # source is an existing handle, target is created from default config with this ring
+  my %source = %{ corpus($source) };
+  my %target = %{ corpus($target) };
+  $target{rs}   = $mr{rs}   if exists $mr{rs};
+  $target{crew} = $mr{crew} if exists $mr{crew};
   ctinit(\%target) unless corpusexists(\%target);
   $mr{source}  = "$source{ring}/$source{name}";
   $mr{target}  = "$target{ring}/$target{name}";
@@ -700,33 +825,19 @@ sub tt {
   $mr{crew}    = $source{ring} unless exists $mr{crew};
   $mr{statusport} = (int rand 9000) + 1999;
 
-  create_sandbox(\%mr);
-  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
-  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target{name}.log"), $mr{loglevel});
+  startservices($target{name}, %mr);
   my $log = logger($mr{cmd});
 
-  # start server
-  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
-    my($exit, $sig) = ($err >> 8, $err & 127);
-    $log->(0, "status service failed to start: exit code $exit, sig $sig. Exiting.\n");
-    die "status server failed to start: exit code $exit, sig $sig\n";
-  }
-
-  # clean up on INT or DIE
-  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
-
   # prepare the status service by registering tasks and corresponding tables of objects
-
-  my @tasks = qw( source target crew launch killl mappart reduce );
+  my @tasks = qw( mappartsrc target crew launch killl mappart reduce );
   my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
   die "No hosts in crew $mr{crew}" unless @crew;
-
   my @registers = (
-    [ source  => $source{hosts} ],
-    [ target  => $target{hosts} ],
-    [ mappart => $source{files} ],
-    [ crew    => \@crew         ],
-    [ task    => \@tasks        ],
+    [ mappartsrc  => $source{hosts} ],
+    [ target      => $target{hosts} ],
+    [ mappart     => $source{files} ],
+    [ crew        => \@crew         ],
+    [ task        => \@tasks        ],
   );
 
   for my $tab (@registers){
@@ -740,54 +851,25 @@ sub tt {
   statshift( 'lock' => task => $_ ) for qw( killl reduce );
 
   $log->(0, "executing job spec: " . Dumper \%mr);
-  monitor(\%mr);
+  mapreducemonitor(\%mr);
   kill TERM => `cat $mr{sandbox}/httpd.pid`;
 }
 
-#sub ttexec {
-#  my($mr, @args) = @_;
-#  my %mr = %$mr;
-#  my($target, @extra);
-#  ($mr{mapcmd}, $target, @extra) = @args;
-#  die usage() if @extra;
-#  die usage() unless defined $target;
-#
-#  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target.log"), $mr{loglevel});
-#  my $log = logger($mr{cmd});
-#
-#  # target is created from default config
-#  my %target = %{ corpus($target) };
-#  ctinit(\%target) unless corpusexists(\%target);
-#  $mr{target}  = "$target{ring}/$target{name}";
-#  $mr{sandbox} = "/tmp/robotarmy-$target{name}-$target{nodename}";
-#  $mr{ring} = $target{ring};
-#  $mr{crew}    = $target{ring} unless exists $mr{crew};
-#  $mr{statusport} = (int rand 9000) + 1999;
-#
-#  create_sandbox(\%mr);
-#  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
-#  
-#  # start server
-#  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
-#    my($exit, $sig) = ($err >> 8, $err & 127);
-#    $log->(0, "status service failed to start: exit code $exit, sig $sig. Exiting.\n");
-#    die "status server failed to start: exit code $exit, sig $sig\n";
-#  }
-#
-#  # clean up on INT or DIE
-#  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
-#
-#  die "Could not register hosts" 
-#    unless register(source => $target{hosts} )->is_success;
-#  $log->(0, "registered " . scalar @{$target{hosts}} . " hosts in ring $target{ring}\n");
-#  
-#  execmonitor(\%mr);
-#  
-#  kill TERM => `cat $mr{sandbox}/httpd.pid`;
-#}
-#
+sub startservices {
+  my ($target, %mr) = @_;
+  create_sandbox(\%mr);
+  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$mr{statusport}/ttstatus" );
+  setlog( ($mr{verbose} ? ">&STDERR" : ">$mr{proj}/$target.log"), $mr{loglevel});
 
+  # start status server
+  if(my $err = system "$mr{httpd} -f $mr{sandbox}/httpd.conf"){
+    my($exit, $sig) = ($err >> 8, $err & 127);
+    die "status server failed to start: exit code $exit, sig $sig\n";
+  }
 
+  # clean up on INT or DIE
+  $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
+}
 
 # create the local and remote configuration environments
 sub create_sandbox {
@@ -848,7 +930,7 @@ EOF
 # - record any results into the output corpus
 # - maintain the still-to-be-processed input chunks in a subcorpus (and the partitions
 #   in a special partition corpus if mapreduce)
-sub monitor {
+sub mapreducemonitor {
   my $mr = shift;
   my %mr = %$mr;
   $0 = "robot army monitor ($mr{mapcmd})";
@@ -862,11 +944,9 @@ sub monitor {
   $log->(0, "launched master client in sandbox with code $ret\n");
 
   my @funcs = ();
-#  push @funcs, inventorying($mr);
-#  push @funcs, installerlauncher($mr);
-  push @funcs, kicker('source', $mr{statusport}, 5*60);
+  push @funcs, kicker('mappartsrc', $mr{statusport}, 5*60);
   push @funcs, chopper(@kickdata);
-  push @funcs, input_checkpointer($mr{source}, $mr{target}, $mr{statusport});
+  push @funcs, input_checkpointer('mappart', $mr{source}, $mr{target}, $mr{statusport});
   push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
 
   my $recordout = 
@@ -874,20 +954,47 @@ sub monitor {
   monitorloop($log, $recordout, @funcs);
 }
 
-#sub execmonitor {
-#  my $mr = shift;
-#  my %mr = %$mr;
-#  $0 = "robot army $mr{cmd} monitor";
-#  my $log = logger("$mr{cmd} monitor");
-#  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
-#
-#  my @funcs = ();
-#  push @funcs, installerlauncher($mr);
-#  push @funcs, stderr_recorder($mr{crew}, $mr{target}, $mr{statusport});
-#
-#  my $recordout = output_recorder($mr{target}, 'source', $mr{statusport});
-#  monitorloop($log, $recordout, @funcs);
-#}
+sub mapmonitor {
+  my $mr = shift;
+  my %mr = %$mr;
+  $0 = "robot army monitor ($mr{mapcmd})";
+  my $log = logger("$mr{cmd} monitor");
+  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
+
+  my $ret = system "cd $mr{sandbox}/client; perl bin/ttclient $mr{master} 1";
+  $log->(0, "launched master client in sandbox with code $ret\n");
+
+  my @funcs = ();
+  push @funcs, kicker('justmapsrc', $mr{statusport}, 5*60);
+  push @funcs, kicker('justmap',    $mr{statusport}, 5*60);
+  push @funcs, input_checkpointer('justmap', $mr{source}, $mr{target}, $mr{statusport});
+  push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
+
+  my $recordout = 
+    output_recorder($mr{target}, 'justmap', $mr{statusport});
+  monitorloop($log, $recordout, @funcs);
+}
+
+sub execmonitor {
+  my $mr = shift;
+  my %mr = %$mr;
+  $0 = "robot army monitor ($mr{mapcmd})";
+  my $log = logger("$mr{cmd} monitor");
+  clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
+
+  my $ret = system "cd $mr{sandbox}/client; perl bin/ttclient $mr{master} 1";
+  $log->(0, "launched master client in sandbox with code $ret\n");
+
+  my @funcs = ();
+  push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
+
+  my $recordout = 
+    output_recorder($mr{target}, 'execute', $mr{statusport});
+  monitorloop($log, $recordout, @funcs);
+}
+
+
+
 
 sub monitorloop {
   my ($log, $final, @funcs) = @_;
@@ -1103,7 +1210,7 @@ sub stderr_recorder {
 # returns a closure which maintains a checkpointed "corpus" of input chunks left
 # REWRITE TO USE HASHTABLE WITH DELETIONS ?
 sub input_checkpointer {
-  my ($source, $target, $port) = @_;
+  my ($srctype, $source, $target, $port) = @_;
   my $log = logger('input checkpointer');
   my %conf = %{ corpus($source) };
   my %target = %{ corpus($target) };
@@ -1112,7 +1219,7 @@ sub input_checkpointer {
 
   my $count = 0;
   return sub {
-    my ($unlocked, $locked) = object_count('mappart');
+    my ($unlocked, $locked) = object_count($srctype);
     my $current = $unlocked + $locked;
     $log->(0, "found $current unfinished inputs\n");
     unless ($current){ # finish up if nothing left
@@ -1123,9 +1230,9 @@ sub input_checkpointer {
     return 1 if $current == $count;
 	$count = $current;
 
-    $log->(0, "recording $current 'mappart' objects in $conf{name}\n");
-    my @free = object_count('mappart', 0); # 0 == FREE
-    my @lokd = object_count('mappart', 1); # 1 == LOKD
+    $log->(0, "recording $current '$srctype' objects in $conf{name}\n");
+    my @free = object_count($srctype, 0); # 0 == FREE
+    my @lokd = object_count($srctype, 1); # 1 == LOKD
     @{$conf{files}} = map { $_->[0] } @free, @lokd;
     writecorpus(\%conf);
     return 1;
@@ -1198,7 +1305,7 @@ Corpus control commands:
       -replicate      (replication factor)
       -chunksize      (target uncompressed data file size)
       -rs             (record separator)
-	  -uncompressed   (turn off compressing data files)
+      -uncompress     (turn off compressing data files)
     
 
 Distributed processing commands:
@@ -1211,12 +1318,13 @@ Distributed processing commands:
 
       Options for exec/map/mapreduce commands:
       -maps=n           (number of processes to launch per host)
-      -replicate=n      (result corpus replication factor)
-      -nosort           (only for mapreduce - refrain from sorting before reducing)
-      -partition=P      (only for mapreduce - substitute a different partition program P)
       -rs=s             (the output record separator, if not newline)
       -crew=s           (the cluster to use for execution, if not the default)
       -verbose          (master's execution log to the screen instead of to log file)
+
+      Options for mapreduce only:
+      -format=[txt,kv]  (result corpus type: flat record store or key-value)
+      -partition=P      (substitute a different partition program P)
 
 Use "robots help COMMAND" for details on each.
 USAGE
@@ -1279,10 +1387,9 @@ COPY
     add => <<ADD
 Usage: robots add "corpus" "source"
 
-  Converts data from a file, directory or stream and places it in a corpus.
+  Converts data from a stream and places it in a flat record corpus.
 
 Examples: 
-  robots add odyssey odyssey.txt
   cat odyssey.txt | ct add odyssey
   robots add homer texts/
 ADD
@@ -1418,12 +1525,12 @@ CMD
 Usage: robots exec "crew" /command/ "ring/output" {options}
 
   Issue an arbitrary shell command on all hosts in cluster "crew", saving the 
-  results in corpus "ring/output". DANGER! You can do a lot of damage with this 
-  command. The invocations are parallel, so all hosts will execute at once. 
+  results in flat corpus "ring/output". DANGER! You can do a lot of damage with 
+  this command. The invocations are parallel, so all hosts will execute at once. 
   This is appropriate for long-running commands, or ones with large outputs 
   that you'd like to save in a corpus. Also nice for administrative tasks. The 
   execution context *is* synchronized, making it a convenient way to 
-  distribute a file or directory See examples for, e.g., a way to quickly 
+  distribute a directory of files. See examples for, e.g., a way to quickly 
   update your known_hosts file to all tt users on a cluster. This is possible
   since invocations are made from within the execution context, but the 
   outside filesystem is fully accessible.
@@ -1433,15 +1540,15 @@ Usage: robots exec "crew" /command/ "ring/output" {options}
 
 Examples:
   robots exec homer 'apt-get Digest::SHA1' sha1install -verbose
-  cd; robots exec homer 'rsync -av .ssh/known_hosts  ~/.ssh/known_hosts'
+  cd ~/.ssh; robots exec homer 'rsync -av known_hosts  ~/.ssh/known_hosts'
 EXEC
 ,
     'map' => <<MAP
 Usage: robots map "input" /command/ "output" {options}
 
   Transform the contents of corpus "input" according to /command/, placing the 
-  result in corpus "output". Execution context is synchronized, and commands 
-  are invoked in parallel.
+  result in flat corpus "output". Execution context is synchronized, and 
+  commands are invoked in parallel.
 
 Examples:
   robots map iliad 'perl -ne "print if /agamemnon/i"' iliad-ag-lines
@@ -1454,10 +1561,12 @@ Usage: robots mapreduce "input" /transform/ /aggregate/ "output" {options}
   Transform the contents of corpus "input" according to the command 
   /transform/, partition the results, and aggregate them using the command 
   /aggregate/. Place the result in corpus "output". Execution context is 
-  synchronized, and commands are invoked in parallel.
+  synchronized, and commands are invoked in parallel. Passing -format=kv will
+  result in a kv type corpus.
 
 Examples:
   robots mapreduce bigcorpus 'sed s/ /\\n/' 'uniq -c' bigcorp-wordcount
+
 (this example implements the global word frequency count task -- inefficiently)
 MAPREDUCE
 ,

@@ -3,6 +3,7 @@ use strict;
 
 use FileHandle;
 use Digest::MD5 qw( md5_hex );
+use Compress::LZO;
 use constant TYPE   => 0;
 use constant KEY    => 1;
 use constant PART   => 2;
@@ -22,7 +23,14 @@ while(<>){
   my ($key) = split /\t/;
   next unless defined $key;
   $key = ($key =~ /^[a-f\d]{32}$/i) ? lc($key) : md5_hex($key);
-  push @table, [ 'record', $key, $_ ]; 
+
+  # compress and yencode to remove nulls and tabs
+  my $compressed = Compress::LZO::compress($_);
+  $_ = defined $compressed ? 'C'.$compressed : 'U'.$_;
+  tr[\326-\377\000-\325][\000-\377];
+  s/([\0\t=])/'='.chr(ord($1)+64 & 255)/egosx;  
+
+  push @table, [ 'record', $key, $_ ];
 }
 
 for my $i ( 0 .. scalar(@$hosts)-1 ){
@@ -76,4 +84,6 @@ sub readlist {
   }
   return \@list;
 }
+
+
 

@@ -329,10 +329,10 @@ sub ring_and_corpus {
 
 
 sub choosestream {
-  my ($file, $source) = @_;
+  my ($file, $source, $decoder) = @_;
   my %source = %$source;
   if($source{format} eq 'kv'){
-    return "sqlite3 $file 'select v from kv'";
+    return "sqlite3 $file 'select v from kv' | $decoder";
   } elsif(exists $source{uncompress}){
     return "cat $file";
   } else {

@@ -2,11 +2,8 @@
 use strict;
 use Compress::LZO;
 
-$/ = chr(0);
-
 while(<>){
-  s/^[a-f\d]{32}\t//i; # remove sort key
-  s/\x00$//;           # chop
+  chomp;
 
   # ydecode
   s/=(.)/chr(ord($1)+256-64 & 255)/egosx;
@@ -16,7 +13,4 @@ while(<>){
   $_ = Compress::LZO::decompress($_) if $flag eq 'C';
   print;
 }
-
-
-
 

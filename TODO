@@ -4,9 +4,64 @@ Things on the roadmap. You can help out with any of these.
 
 - A spiffy new retro-style logo for the Robot Army. Include the motto "E Pluribus Machina"
 
-- Create/revise documentation (Help texts in bin/robots, the Install Guide, the User Guide, the Admin Guide).
+- Create/revise documentation 
+  - Elevator pitch / abstract
+  - Help texts in bin/robots
+  - User Guide
+    - operations: map, mapreduce, exec, cmd, 
+    - corpus tool funcs
+  - Install/Admin Guide
+    - adding users
+    - adding machines
+    - creating clusters
+    - installing software on workers
 
 - Suggest design improvements
 
+
+
+Bugs:
+
+- user feedback during reduce phase is inaccurate
+
+- add at least one test for exec op in t/TT.t
+
+- refactor bin/robots ttmap/ttexec/ttmapreduce and the corresponding monitor() funcs, these are highly pasted.
+
+- clean up corpus creation semantics. What a mess.
+
+- no space left on device should be handled more smoothly
+
+- shadow corpora on exec op are invisible
+
+- deletion of corpus does not delete all shadow corpora if crew != rings
+
+- reimplement configuration to use .robotsrc, conf/robotsrc (and cmdline opts) rather than cont/ct.conf, conf/tt.conf. Goal is to have single config file, which will require renaming some things. For instance, record separator options for input/output.
+
+- prove the completeness of operations (new reduce phase not yet proven)
+
+
+Features:
+
+- A quick diagnostic task to speedily verify which robots are ready via exec op possibly
+
+- A "reversion map" visual display of chunks vs machines indicating possible causes (data or environment) of reversions.
+
 - Rewrite the partitioner to base it on a high-performance data structure like a radix trie or something. This will give at least ~20% speed improvement.
+
+- preaggregation option in transitive mapreduce operation
+
+- For job control, record the user program's pid somewhere so killl interventions can take immediate effect by terminating long-lived executions.
+
+- roll scan.pl and push.pl into bin/robots
+
+- configurable compression schemes [gzip,lzo,lzma] for kv records and flat txt chunks.
+
+- an fsck for rings (deeper than 'check')
+
+- new operation: merge. Takes two kv corpora with compatible keys and passes each corresponding pair of records/chunks to the user program.
+
+- new operation: matrix. Takes two corpora and passes every (m*n) pair of records/chunks to the user program. Expensive but powerful.
+
+
 

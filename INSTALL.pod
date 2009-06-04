@@ -42,12 +42,15 @@ None of the above need be true. For instance the master machine can also partici
 
 =head1 Install prerequisites
 
-Set up lighttpd with FastCGI enabled (master only)
+On the master:
 
-Install perl modules FCGI and JSON (master only)
+Set up lighttpd with FastCGI enabled.
+Install perl modules FCGI and JSON.
 
-Install libwww-perl (master and all workers)
+On the master and all workers:
 
+Install the lzo and lzma libraries.
+Install perl modules Compress::Zlib, Compress::LZO, Compress::LZMA, libwww-perl.
 Make sure sshd is running on all machines.
 
 

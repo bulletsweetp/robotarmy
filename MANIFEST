@@ -22,12 +22,12 @@ status/keys/.exists
 client/bin/partition
 client/bin/ttclient
 client/bin/rmnulls
+client/bin/valuethaw
 client/clusters/.exists
 client/conf/.exists
 client/err/.exists
 client/foreign/.exists
 client/log/.exists
-client/proj/.exists
 lib/shared.pl
 t/CT.t
 t/TT.t

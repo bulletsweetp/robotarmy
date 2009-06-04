@@ -26,6 +26,7 @@ use warnings;
 use FileHandle;
 use DBI;
 use Digest::MD5 qw{ md5_hex };
+use Compress::LZO;
 use LWP::UserAgent;
 use HTTP::Request;
 #use Getopt::Long;
@@ -81,26 +82,31 @@ sub mainloop {
 sub init {
   my ( $conf, $thishost, $cpu ) = @_;
   my %conf         = %$conf;
-  my %source       = %{ corpus( $conf{source} ) };
+  my %source       = exists $conf{source} ? %{ corpus( $conf{source} ) } : ();
   my %target       = %{ corpus( $conf{target} ) };
   my @crew         = @{ readlist("clusters/$conf{crew}/.hosts") };
   my $context      = "$conf{context}/$conf{proj}";
   my $localcontext = ( $conf{master} eq $thishost ) ? $conf{proj} : $context;
 
   my %priority = ( 
-	killl   => 1,
-	launch  => 1,
-	crew    => 2,
-	target  => 3,
-    source  => 3,
-	mappart => 4, 
-	reduce  => 4, 
+    killl   => 1,
+    launch  => 1,
+    crew    => 2,
+    target  => 3,
+    justmapsrc => 3,
+    mappartsrc => 3,
+    execute => 4,
+    justmap => 4,
+    mappart => 4, 
+    reduce  => 4, 
   );
 
   # if this is the master host:
   # - just help with the infrastructure but don't execute any user code
   # - execution context is the original, so don't prefix it with a context repos
   if($conf{master} eq $thishost){
+    delete $priority{execute};
+    delete $priority{justmap};
     delete $priority{mappart};
     delete $priority{reduce};
     my $localcontext = $conf{proj};
@@ -117,7 +123,7 @@ sub init {
     lg           => logger("$thishost($cpu)"),
     mapper       => $conf{mapcmd},
     partitioner  => ( $conf{partition} || 'partition' ),
-    localfiles   => [ map { (m|([^/]+)$|) } glob("$source{data}/*") ],
+    localfiles   => (exists $source{data} ? [ map { (m|([^/]+)$|) } glob("$source{data}/*") ] : []),
     source       => \%source,
     target       => \%target,
   );
@@ -134,9 +140,17 @@ sub init {
 
 
 # inventory input data for a host
-sub source {
-  my %c = @_;
-  my $host = lockone('source', []);
+sub justmapsrc {
+  inventory(justmapsrc => justmap => @_);
+}
+
+sub mappartsrc {
+  inventory(mappartsrc => mappart => @_);
+}
+
+sub inventory {
+  my ($from, $to, %c) = @_;
+  my $host = lockone($from, []);
   return unless @$host;
   $host = $host->[0];
   my $files = inventory_host($host, $c{source}{data});
@@ -144,9 +158,8 @@ sub source {
   my %found = map {$_=>1} @$files;
   my @files = grep { exists $found{$_} } @{ $c{source}{files} };
   $c{lg}->(0, "registering " . scalar @files . " files from $host\n");		      
-  register(mappart => \@files, source => $host);
+  register($to => \@files, $from => $host);
 }
-
 
 # prepare output area on a host
 sub target {
@@ -216,42 +229,85 @@ sub killl {
 
 ## map and partition
 sub mappart {
+  my ($id, $name) = universalmap('mappart', @_);
+  return unless $id;
+
+  # partition mapped file
   my %c = @_;
-  my $chunk = lockone( 'mappart', $c{localfiles} );
-  return unless @$chunk;
-  my ( $name, @locations ) = @$chunk;
-  my $file = "$c{source}{data}/$name";
-  my $id   = substr( $name, 0, 32 );
-  my $err  = "$c{target}{data}/client/err/$id";
-
-  unless ( -e $file ) {
-    retrieve_foreign( $file, @locations );
-    statshift( free => mappart => $name ) && return unless -e "foreign/$name";
-    $file = "$c{target}{data}/client/foreign/$name";
-  }
-
-  my $catin  = choosestream( $file, $c{source} );
-  my $src_rs = "TTRS='$c{source}{rs}'";
   my $mid_rs = exists $c{mid_rs} ? "TTRS='$c{mid_rs}'" : '';
-  my $pipe   =
-      "cd $c{context}; "
-    . "$catin | $src_rs $c{mapper} 2>$err | "
+  system "cat $id-mapped |"
     . "$mid_rs $c{target}{data}/client/bin/$c{partitioner} $c{target}{data} $name $c{target}{ring} $c{target}{vnodes}";
-
-  my $ret = system $pipe;
-  if ($ret) {
-    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ". (Error, REVERTING MAPPART)\n" );
-    statshift( free => mappart => $name );
-    unlink "foreign/$name" if -e "foreign/$name";
-    next;
-  }
-
+ 
+  # register partitions / retire input chunk	
   my @parts = map { (m|/(\d+)/[^/]+$|) } glob("$c{target}{data}/parts/*/$name");
   $c{lg}->( 0, "map'd $id to " . scalar @parts . " parts\n" );
   register( reduce => \@parts, mappart => $name );
-  unlink "foreign/$name" if -e "foreign/$name";
-  register_errchunk( $err, $id );
+  $c{lg}->( 0, "finished mappart task.\n" );
+  unlink "$id-mapped";
+
+  # unlock reduce table if this is the last input chunk
   bump_reduce_table($c{lg});
+}
+
+
+# map without partitioning
+sub justmap {
+  my ($id, $name) = universalmap('justmap', @_);
+  my %c = @_;
+  unless($id){
+    $c{lg}->(0, "justmap failed, returning\n");
+    return;
+  }
+
+  # seat mapped file / retire input chunk
+  my $chunks = seat( $c{target}, $id, FileHandle->new("<$id-mapped"), $c{thishost} );
+  $c{lg}->( 0, "map'd $id to $chunks output chunks\n" );
+  register( 'out' => [], justmap => $name );
+  $c{lg}->( 0, "finished justmap task.\n" );
+  unlink "$id-mapped";
+}
+
+
+sub universalmap {
+  my ($tabletype, %c) = @_;
+  my $chunk = lockone( $tabletype, $c{localfiles} );
+  unless(@$chunk){
+    $c{lg}->(0, "lockone($tabletype) failed to return anything useful, universalmap returning undef\n");
+    return undef;
+  }
+  my ( $name, @locations ) = @$chunk;
+  my $file = "$c{source}{data}/$name";
+  my $id   = substr( $name, 0, 32 );
+  my $home = "$c{target}{data}/client"; # u r here
+  my $err  = "$home/err/$id";
+
+  unless ( -e $file ) {
+    retrieve_foreign( $file, @locations );
+    unless (-e "foreign/$name"){
+      $c{lg}->(0, "retrieve_foreign() on $name failed, REVERTING $tabletype\n");
+      statshift( free => $tabletype => $name );
+      sleep int rand(5);
+	  return undef;
+    }
+    $file = "$home/foreign/$name";
+  }
+
+  my $catin  = choosestream( $file, $c{source}, "$home/bin/valuethaw" );
+  my $src_rs = "TTRS='$c{source}{rs}'";
+  my $pipe   =
+      "cd $c{context}; "
+    . "$catin | $src_rs $c{mapper} 2>$err > $home/$id-mapped";
+
+  my $ret = system $pipe;
+  if ($ret) {
+    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ". (Error, REVERTING $tabletype)\n" );
+    statshift( free => $tabletype => $name );
+    unlink "foreign/$name" if -e "foreign/$name";
+    unlink "$id-mapped"    if -e "$id-mapped";
+    return undef;
+  }
+  register_errchunk( $err, $id );
+  return ($id, $name);
 }
 
 # check to see if all mappart entries are finished. 
@@ -303,7 +359,7 @@ sub reduce {
   my $pipe = new FileHandle
     "cd $conf{context}/$conf{proj}; $cat | $conf{reducecmd} 2>$err |";
 
-  my $count = seatparts( $part, $pipe, $c{target}, $c{thishost} );
+  my $count = seat( $c{target}, $part, $pipe, $c{thishost} );
   unlink @frags;
   register_errchunk( $err, $part ); # do this before master can exit
   my $rstat = register( out => [], reduce => $part );
@@ -311,22 +367,25 @@ sub reduce {
 }
 
 
-# Execute: mappart with no input corpus (DEPRECATED)
+# map with no input corpus
 sub execute {
-  my $c   = shift;
-  my %c   = %$c;
+  my %c   = @_;
   my $env = "TTRS='$c{target}{rs}' TTHOST=$c{thishost}";
   my $id  = md5_hex( $c{thishost} );
   my $err = "$c{target}{data}/client/err/$id";
-  $c{lg}->( 0, "source lock failed" )
-    unless statshift( 'lock' => execute => $c{thishost} )->is_success;
-  looseend( 'source lock',
-    sub { register( out => [], source => $c{thishost} ) } );
+  unless( statshift( 'lock' => execute => $c{thishost} )->is_success){
+    $c{lg}->( 0, "self lock failed on $c{thishost} (me)\n" );
+    sleep int rand(5);
+    return;
+  }
 
-  my $pipe   = "cd $c{context}; $env $conf{mapper} 2>$err";
-  my $chunks =
-    seatstream( $id, FileHandle->new("$pipe|"), $c{target}, $c{thishost} );
-  register( 'out' => [], source => $c{thishost} );
+  # unlock this host/proc's entry in case of unrecoverable error
+  looseend( 'execute lock',
+    sub { register( out => [], execute => $c{thishost} ) } );
+
+  my $pipe   = FileHandle->new("cd $c{context}; $env $c{mapper} 2>$err |");
+  my $chunks = seat( $c{target}, $id, $pipe, $c{thishost} );
+  register( 'out' => [], execute => $c{thishost} );
   $c{lg}->( 0, "exec finished seating $chunks chunks.\n" );
 
   register_errchunk( $err, $id );
@@ -470,9 +529,15 @@ sub fyshuffle {
   return $array;
 }
 
+sub seat {
+  my($conf) = @_;
+  if($conf->{format} eq 'txt'){ return seatstream(@_); }
+  else                        { return seatparts(@_); }
+}
 
+# seat a stream of data to a flat record corpus
 sub seatstream {
-  my ( $sig, $fd, $conf, $thishost ) = @_;
+  my ( $conf, $sig, $fd, $thishost ) = @_;
   my %conf = %$conf;
   my $rs   = $conf{rs};
   my @hosts = @{ $conf{hosts} };
@@ -512,21 +577,22 @@ sub seatstream {
 
   $startoutfile->();
   while (<$fd>) {
-    $bytes += length $_;
-    print $outfd $_ or fatal($!);
-    $records++;
-    if ( $bytes >= $conf{chunksize} ) {
+    if ( $bytes and ( ($bytes + length($_)) > $conf{chunksize} 	) ) {
       $endoutfile->();
       $startoutfile->();
     }
+    $bytes += length $_;
+    print $outfd $_ or fatal($!);
+    $records++;
   }
   $endoutfile->();
   return $chunks;
 }
 
 
+# seat a sorted stream of data to a key-value corpus
 sub seatparts {
-  my ( $sig, $fd, $conf, $thishost ) = @_;
+  my ( $conf, $sig, $fd, $thishost ) = @_;
   my %conf = %$conf;
   my $rs   = $conf{rs};
   my @hosts = @{ $conf{hosts} };
@@ -581,28 +647,37 @@ sub seatparts {
       $log->(0, "found next vnode ".$hashring[0]->[0]." gt record $key\n");
     }
     $bytes += length $_;
-    s/\n$//s; # hack to compensate for sqlite3 appending \n to everything
-    $outhandle->execute($key, $_) or fatal($!);
+	#s/\n$//s; # hack to compensate for sqlite3 appending \n to everything
+    $outhandle->execute($key, valuefreeze(\$_)) or fatal($!);
     $records++;
   }
   $endoutfile->();
   return $chunks;
 }
 
+# compress/remove null and newline/cr from record
+sub valuefreeze {
+  my $ptr = shift;
+  my $z = Compress::LZO::compress($$ptr);
+  $z = (defined $z and length($z)<length($$ptr)) ? 'C'.$z : 'U'.$$ptr;
+  $z =~ tr[\326-\377\000-\325][\000-\377];
+  $z =~ s/([\0\n\r=])/'='.chr(ord($1)+64 & 255)/egosx;
+  return $z;
+}
 
 # loose ends list
 {
   my %loose = ();
   my $log;
   sub looseend {
-    $log ||= logger("fatal error cleanup");
+    $log = logger("fatal error cleanup") unless $log;
     my($key, $sub) = @_;
-    $log->("registered $key for cleanup");
+    $log->(0, "registered '$key'\n");
     $loose{$key} = $sub;
   }
   sub fatal {
     while(my($k,$s) = each %loose){
-      $log->("cleaning up $k");
+      $log->("cleaning up $k\n");
       $s->();
     }
     exit @_;
