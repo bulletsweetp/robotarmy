@@ -3,11 +3,8 @@ use strict;
 
 use FileHandle;
 use Digest::MD5 qw( md5_hex );
-use Compress::LZO;
-use constant TYPE   => 0;
-use constant KEY    => 1;
-use constant PART   => 2;
-use constant RECORD => 2;
+use constant KEY    => 0;
+use constant PART   => 1;
 
 # set the input record separator
 $/ = $ENV{TTRS} if exists $ENV{TTRS};
@@ -18,53 +15,53 @@ my ($path, $sig, $ring, $vnodes) = splice @ARGV, 0, 4;
 my $hosts = readlist("$path/client/clusters/$ring/.hosts");
 chomp @$hosts;
 
-my @table;
-while(<>){
-  my ($key) = split /\t/;
-  next unless defined $key;
-  $key = ($key =~ /^[a-f\d]{32}$/i) ? lc($key) : md5_hex($key);
-
-  # compress and yencode to remove nulls and tabs
-  my $compressed = Compress::LZO::compress($_);
-  $_ = defined $compressed ? 'C'.$compressed : 'U'.$_;
-  tr[\326-\377\000-\325][\000-\377];
-  s/([\0\t=])/'='.chr(ord($1)+64 & 255)/egosx;  
-
-  push @table, [ 'record', $key, $_ ];
-}
-
+my @hashring;
+my $part = 0;
 for my $i ( 0 .. scalar(@$hosts)-1 ){
   my $host = $hosts->[$i];
-  push @table, [ 'host', md5_hex("$host:$_"), $i ] for (1..$vnodes);
+  push @hashring, [ md5_hex("$host:$_"), $part++ ] for (1..5);
 }
+@hashring = sort { $a->[0] cmp $b->[0] } @hashring;
+push @hashring, [ 'f' x 32, $part ]; # wrap highest value node
 
-@table = sort { $a->[KEY] cmp $b->[KEY] } @table;
 
-my %htable = ();
-my $out = '';
-for(@table){
-  if($_->[TYPE] eq 'host'){
-    if($out){
-      $htable{$_->[PART]} .= $out;
-      $out = '';
+my ($fd, $records, $bytes);
+
+my $startoutfile = sub {
+  $part = $hashring[0]->[PART];
+  mkdir "$path/parts/$part" unless -d "$path/parts/$part";
+  $fd      = FileHandle->new(">$path/parts/$part/$sig");
+  $records = 0;
+  $bytes   = 0;
+};
+
+my $endoutfile = sub {
+  my $chunkname = $hashring[0]->[0] . ".$records.$bytes";
+  $fd->close;
+  rename "$sig-out", $chunkname;
+  unlink $chunkname unless ( $bytes > 0 );
+};
+
+$startoutfile->();
+while (<>) {
+  my ($key) = split /\t/;
+  next                                      unless defined $key;
+  next                                      unless $key =~ /^[a-f\d]{32}$/i;
+  die("Hashring somehow empty at key $key") unless @hashring;
+  if ( $key gt $hashring[0]->[KEY] ) {
+    $endoutfile->();
+    while ( @hashring and ( $key gt $hashring[0]->[KEY] ) ) {
+      shift @hashring;
     }
-    next;
+    $startoutfile->();
   }
-  $out .= $_->[KEY] ."\t". $_->[RECORD] . chr(0);
+  $bytes += length $_;
+  $fd->print($_);
+  $records++;
 }
-# wraparound
-if($out){
-  $htable{'0'} .= $out;
-}
-
-while(my($part, $out) = each %htable){
-  open RECS, ">$path/parts/$part/$sig" or die $!;
-  print RECS $out;
-  close RECS;
-}
+$endoutfile->();
 
 exit 0;
-
 
 
 
@@ -84,6 +81,11 @@ sub readlist {
   }
   return \@list;
 }
+
+
+
+
+
 
 
 

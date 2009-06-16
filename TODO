@@ -22,15 +22,13 @@ Things on the roadmap. You can help out with any of these.
 
 Bugs:
 
-- user feedback during reduce phase is inaccurate
+- no space left on device should be handled more smoothly
 
 - add at least one test for exec op in t/TT.t
 
 - refactor bin/robots ttmap/ttexec/ttmapreduce and the corresponding monitor() funcs, these are highly pasted.
 
 - clean up corpus creation semantics. What a mess.
-
-- no space left on device should be handled more smoothly
 
 - shadow corpora on exec op are invisible
 
@@ -46,8 +44,6 @@ Features:
 - A quick diagnostic task to speedily verify which robots are ready via exec op possibly
 
 - A "reversion map" visual display of chunks vs machines indicating possible causes (data or environment) of reversions.
-
-- Rewrite the partitioner to base it on a high-performance data structure like a radix trie or something. This will give at least ~20% speed improvement.
 
 - preaggregation option in transitive mapreduce operation
 

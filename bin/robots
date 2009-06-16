@@ -27,7 +27,7 @@ use LWP::UserAgent;
 use HTTP::Request;
 use Data::Dumper;
 
-our $VERSION = 0.37;
+our $VERSION = 0.38;
 
 my $ssh = 'ssh -q -o "ConnectTimeout 1"';
 my $scp = 'scp -q -o "ConnectTimeout 1"';
@@ -54,7 +54,6 @@ my %OPTS = (
 
   # TransTabulator opts
   "maps=i"      => ar(0),  # num of procs per machine
-  "partition=s" => ar(''), # substitute a different partitioner
   "crew=s"      => ar(''), # the cluster to use for execution, if not the default ring
   "context=s"   => ar(''), # path to the execution contexts
 );
@@ -221,7 +220,7 @@ sub ctlist {
     my ($chunks, $records, $bytes) = chunkmeta(%$conf);
     push @entries, [ $ring, $corpus, $conf->{format}, 
                      (exists $conf->{uncompress}?'':'*'), 
-	                 $records, $bytes, $chunks, $conf->{rs} ];
+                     $records, $bytes, $chunks, $conf->{rs} ];
   }
   print "\n", scalar @corpora, " corpora:\n";
   print formatlist(\@headers, \@entries), "\n";
@@ -380,11 +379,11 @@ sub ctdelete {
     ctcmd($conf{crew}, "rm -r $conf{repos}/$conf{nodename}") if exists $conf{crew};
 
     # delete any shadows
-	my $name = "clusters/$conf{ring}/$conf{name}";
+    my $name = "clusters/$conf{ring}/$conf{name}";
     for ( '', qw([input] [err] [log]) ){
       unlink "$name$_" if -e "$name$_";
-	  unlink "$name$_.files" if -e "$name$_.files";
-    }	
+      unlink "$name$_.files" if -e "$name$_.files";
+    }    
   }
 }
 
@@ -407,7 +406,7 @@ sub ctcheck {
   die "Corpus $conf{name} not found" unless corpusexists(\%conf);
   my @shadow =  map { m|^clusters/[^\/]+/(.+)$|; } 
                grep { !/\.files$/ } 
-			   glob("clusters/*/$conf{name}\[*");
+               glob("clusters/*/$conf{name}\[*");
   @shadow = ('none') unless @shadow;
   
   my $inv = inventory(\%conf);
@@ -679,9 +678,9 @@ sub ctdf {
   my ($total, $used, $avail) = (0,0);
   for (@lines){
     my @fields = split /\s+/;
-	$total += $fields[1];
-	$used  += $fields[2];
-	$avail += $fields[3];
+    $total += $fields[1];
+    $used  += $fields[2];
+    $avail += $fields[3];
   }
   print "\n$ring:\nMB Total[$total] Used[$used] Available[$avail]\n";
 }
@@ -866,6 +865,8 @@ sub startservices {
     my($exit, $sig) = ($err >> 8, $err & 127);
     die "status server failed to start: exit code $exit, sig $sig\n";
   }
+  my $master = $mr{master}; $master =~ s/^.+?\@//;
+  print STDERR "started status service: http://$master:$mr{statusport}/ttstatus\n";
 
   # clean up on INT or DIE
   $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
@@ -884,7 +885,6 @@ sub create_sandbox {
   system "cp -r clusters/*           $client/clusters/."; # simple if a bit brutish
   system "cp -r conf                 $client/conf";
   system "cp -r lib                  $client/lib";
-  system "cp $mr{partition}          $client/bin/." if exists $mr{partition};
   system "cp client/bin/*            $client/bin/.";
   writeconf(\%mr, "$client/conf/task.conf");
 
@@ -998,6 +998,8 @@ sub execmonitor {
 
 sub monitorloop {
   my ($log, $final, @funcs) = @_;
+#  my $status = "displaystatus";
+#  push @funcs, \&$status;
   while( 1 ){
     @funcs = grep { $_->() } @funcs;
     last unless $final->();  # this is what really says when we're ready to wrap up
@@ -1005,6 +1007,25 @@ sub monitorloop {
     sleep 5;
   }
   $_->() for @funcs; # one last time then we're done
+}
+
+
+# an alternative to using kicker to display status
+sub displaystatus {
+  my %display = (
+    mappart => 1,
+    justmap => 1,
+    reduce  => 1,
+    execute => 1,
+  );
+  my @tables = object_count('');
+  my @display = grep { $_->[2] } # slot 2 is for locked objects
+                grep { exists $display{$_->[0]} } @tables; 
+  for my $table (@display){
+    my @t = @$table;
+    print STDERR "\r'$t[0]' [remaining: $t[1]], [processing: $t[2]], [done: $t[3]], [reversions: $t[4]]";
+  }
+  return 1;
 }
 
 sub clientlogshadow {
@@ -1054,7 +1075,7 @@ sub clientlogshadow {
 #      $log->(0, "registering " . scalar @files . " files from $host\n");
 #      register(in => \@files, source => $host);
 #    }
-#	return 1;
+#    return 1;
 #  };
 #}
 
@@ -1078,7 +1099,7 @@ sub clientlogshadow {
 #        "$ssh $host 'rm -rf $trg{repos}/$trg{nodename}/client; mkdir -p $trg{repos}/$trg{nodename}; mkdir -p $task{context}/$task{proj}'";
 #      $log->(0, "$host unresponsive, ssh returned " .($ret>>8). " - did not install.\n") && next if $ret;
 #      
-#	  $ret = system 
+#      $ret = system 
 #        "$scp -r $task{sandbox}/client $host\:$trg{repos}/$trg{nodename}/client";
 #      $log->(0, "installed on $host with exit code " . ($ret>>8) . ".\n");
 #    
@@ -1087,7 +1108,7 @@ sub clientlogshadow {
 #      $log->(0, "mirrored exec context on $host with exit code " . ($ret>>8) . ".\n");
 #    }
 #
-#	for my $host (@crew){
+#    for my $host (@crew){
 #      my $i = $crew{$host};
 #      my $cmds = join ';', map {"perl bin/ttclient $i $_"} 1..$task{maps};
 #      my $ret = system "$ssh $host \'cd $trg{repos}/$trg{nodename}/client;$cmds\'";
@@ -1096,7 +1117,7 @@ sub clientlogshadow {
 #    }
 #    return 0 unless %crew; # everybody finished?
 #    @crew = keys %crew;
-#	return 1;
+#    return 1;
 #  };
 #}
 #
@@ -1123,12 +1144,12 @@ sub kicker {
     $log->(0, "found [free $free, lokd $lokd, rtrd $rtrd, oops $oops]\n");
     if( $free ){ # wait until the end to track durations
       $log->(0, "returning, there are free objs\n");
-	  return 1;		
-	}
+      return 1;        
+    }
     unless( $lokd ){ # finish up when all objects have been retired
       $log->(0, "exiting, zero lokd objs\n");
-      return 0;	
-	}
+      return 0;    
+    }
     my $now = time;
     my @lokd = object_count($type, 1); # 1 is 'LOKD'
     my %latest = map { $_ => $now } @lokd;
@@ -1137,13 +1158,14 @@ sub kicker {
     }
     %times = %latest;
 
-	# unlock any locked objects hanging around more than $time secs past the last free file
+    # unlock any locked objects hanging around more than $time secs past the last free file
     my @stillhere = grep {($now - $times{$_}) > $time } keys %times;
     for my $stillhere (@stillhere){ 
       $log->(1, "freeing $stillhere (lokd too long, tardy monkey)\n");
       $times{$stillhere} = $now;
       statshift(free => $type => $stillhere );
     }
+    return 1;
   };
 }
 
@@ -1156,25 +1178,29 @@ sub output_recorder {
 
   return sub {
     my($srcfree,$srclokd,$srcrtrd,$srcoops) = object_count($sourcetype);
+    $log->(0, "found $sourcetype:[$srcfree,$srclokd,$srcrtrd,$srcoops]\n") if defined $srcfree;
 
     my ($free, $lokd) = object_count('out');
-    $log->(0, "found $sourcetype:[$srcfree,$srclokd,$srcrtrd,$srcoops]\n") if defined $srcfree;
-    return 1 unless (defined $free) and $free;
-    $log->(0, "found out:[$free,$lokd] in $target{name}\n");
-    my @free = object_count('out', 0); # 0 == FREE
-    open RESULT, ">>clusters/$target{ring}/$target{name}.files" or die $!;
-    for (@free){
-      my $chunk = $_->[0];
-      next if 
-        statshift('lock' => 'out' => $chunk)->is_error;
-   	  print RESULT "$chunk\n";
+    if(defined($free) and $free){
+      $log->(0, "found out:[$free,$lokd] in $target{name}\n");
+      my @free = object_count('out', 0); # 0 == FREE
+      open RESULT, ">>clusters/$target{ring}/$target{name}.files" or die $!;
+      for (@free){
+        my $chunk = $_->[0];
+        next if 
+          statshift('lock' => 'out' => $chunk)->is_error;
+        print RESULT "$chunk\n";
+      }
+      close RESULT;
+      return 1;
     }
-    close RESULT;
 
-    unless ( $srcfree or $srclokd ){ # finish up if source data is all retired
+    if( $srcfree or $srclokd ){  # keep going if something left in srcfree+srclokd
+      return 1;
+    } elsif($srcrtrd) {          # finish up if source data is all retired and there has been output
       $log->(0, "exiting, job complete (zero [$sourcetype] objects free or lokd left)\n");
       return 0;
-    }
+    } else { return 1; }         # keep going if nothing has happened yet
   };
 }
 
@@ -1200,10 +1226,10 @@ sub stderr_recorder {
       my $chunk = $_->[0];
       next if 
         statshift('lock' => 'err' => $chunk)->is_error;
-   	  print RESULT "$chunk\n";
+      print RESULT "$chunk\n";
     }
     close RESULT;
-	return 1;
+    return 1;
   };
 }
 
@@ -1228,7 +1254,7 @@ sub input_checkpointer {
       return 0;
     }
     return 1 if $current == $count;
-	$count = $current;
+    $count = $current;
 
     $log->(0, "recording $current '$srctype' objects in $conf{name}\n");
     my @free = object_count($srctype, 0); # 0 == FREE
@@ -1297,7 +1323,7 @@ Corpus control commands:
       rename "corpus" "newname"   (renames a corpus to newname)
       copy "corpus" "newcorpus" {options}   (copies existing corpus to newcorpus)
       append "corpus" "other"   (adds corpus data to existing corpus "other")
-      sync "cluster"            (synchronize the current dir as an Execution Environment)
+      df "cluster"              (summarize disk usage/availability on "cluster")
       cmd "cluster" /shellcmd/  (execute /shellcmd/ on each host in this cluster, one by one)
 
       Options for init and/or copy commands (defaults in conf/ct.conf): 
@@ -1346,7 +1372,7 @@ Examples:
   robots help mapreduce
 HELP
 ,
-	list => <<LIST
+    list => <<LIST
 Usage: robots list [corpus]
 
   Print a detailed listing of what corpora are available, with their 
@@ -1501,6 +1527,16 @@ Examples:
   robots check odyssey
   robots check homer/iliad
 CHECK
+,
+    df => <<DF
+Usage: robots df "cluster"
+
+  Print a per-machine listing plus summary of disk usage/availability on a cluster.
+
+Example: 
+  robots df twain
+  robots df homer
+DF
 ,
     cmd => <<CMD
 Usage: robots cmd "cluster" /command/ {options}

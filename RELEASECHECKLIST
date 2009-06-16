@@ -1,4 +1,6 @@
 
 - edit conf/* to default values
 - generate new doc/*.pdf files if documentation has changed
+- perl Makefile.PL; make dist
+- check distro tarball to make sure perl Makefile.PL doesn't notice anything amiss
 

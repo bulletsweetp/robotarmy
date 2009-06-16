@@ -1,0 +1,30 @@
+#!/usr/bin/perl -w
+use strict;
+
+# Create possibly-compressed, null-free, tab-delimited, newline-separated records ready for sorting.
+
+
+#use Compress::LZO;
+use Digest::MD5 qw{ md5_hex };
+
+# set the input record separator
+$/ = $ENV{TTRS} if exists $ENV{TTRS};
+$/ = eval $/ if $/ =~ /^['"]/;
+
+while(<>){
+  my ($key) = split /\t/;
+  next unless defined $key;
+  $key = ($key =~ /^[a-f\d]{32}$/i) ? lc($key) : md5_hex($key);
+
+  # compress and yencode to remove nulls, newlines, tabs
+#  my $compressed = Compress::LZO::compress($_);
+#  $_ = (defined($compressed) and length($compressed) < length($_)) ? 'C'.$compressed : 'U'.$_;
+$_ = 'U' . $_; # experimental non-compress
+  tr[\326-\377\000-\325][\000-\377];
+  s/([\0\n\t=])/'='.chr(ord($1)+64 & 255)/egosx;  
+
+  print $key, "\t", $_, "\n";
+}
+
+exit 0;
+

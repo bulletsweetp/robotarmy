@@ -1,19 +1,21 @@
 #!/usr/bin/perl -w
 use strict;
-use Compress::LZO;
 
-$/ = chr(0);
+# decode, uncompress
+
+#use Compress::LZO;
 
 while(<>){
+  chomp;
   s/^[a-f\d]{32}\t//i; # remove sort key
-  s/\x00$//;           # chop
 
   # ydecode
   s/=(.)/chr(ord($1)+256-64 & 255)/egosx;
   tr[\000-\377][\326-\377\000-\325];
 
-  my $flag = substr($_,0,1); substr($_,0,1) = '';
-  $_ = Compress::LZO::decompress($_) if $flag eq 'C';
+#  my $flag = substr($_,0,1); 
+  substr($_,0,1) = '';
+#  $_ = Compress::LZO::decompress($_) if $flag eq 'C';
   print;
 }
 

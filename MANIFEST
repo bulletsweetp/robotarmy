@@ -21,6 +21,7 @@ status/htdocs/crossdomain.xml
 status/keys/.exists
 client/bin/partition
 client/bin/ttclient
+client/bin/zipencode
 client/bin/rmnulls
 client/bin/valuethaw
 client/clusters/.exists

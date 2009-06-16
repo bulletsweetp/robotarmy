@@ -235,15 +235,17 @@ sub mappart {
   # partition mapped file
   my %c = @_;
   my $mid_rs = exists $c{mid_rs} ? "TTRS='$c{mid_rs}'" : '';
-  system "cat $id-mapped |"
-    . "$mid_rs $c{target}{data}/client/bin/$c{partitioner} $c{target}{data} $name $c{target}{ring} $c{target}{vnodes}";
+  system "cat $id-mapped "
+         . "| $mid_rs $c{target}{data}/client/bin/zipencode"
+         . "| sort -k1,1"
+         . "| $c{target}{data}/client/bin/partition $c{target}{data} $name $c{target}{ring} $c{target}{vnodes}";
  
   # register partitions / retire input chunk	
   my @parts = map { (m|/(\d+)/[^/]+$|) } glob("$c{target}{data}/parts/*/$name");
   $c{lg}->( 0, "map'd $id to " . scalar @parts . " parts\n" );
   register( reduce => \@parts, mappart => $name );
   $c{lg}->( 0, "finished mappart task.\n" );
-  unlink "$id-mapped";
+#  unlink "$id-mapped";
 
   # unlock reduce table if this is the last input chunk
   bump_reduce_table($c{lg});
@@ -333,13 +335,12 @@ sub reduce {
   $c{lg}->( 0, "locked partition $part\n" );
 
   my @frags = assemble_fragments( "$c{target}{data}/parts", $part, $c{crew} );
-  $c{lg}->( 0, "got " . scalar @frags . " frags from partition $part.\n" );
-  statshift( free => reduce => $part ) && next unless @frags;
+  $c{lg}->( 0, "got " . scalar @frags . " frags from part $part.\n" );
 
   # verify all fragments are present for this partition
   my ( $missing, $extra ) = compare_sets( \@sources, \@frags );
   if (@$missing) {
-    $c{lg}->( 0, scalar @$missing . " fragments missing from partition $part, skipping.\n");
+    $c{lg}->( 0, scalar @$missing . " fragments missing from part $part (expected ". scalar(@sources) ."). REVERTING.\n");
     statshift( free => reduce => $part );
     statshift( free => mappart => $_ ) for @$missing;
     return 0;    # reexecute the map phase
@@ -347,15 +348,14 @@ sub reduce {
 
   my $err = "$c{target}{data}/client/err/$part";
   $c{lg}->( 0, "begin concatenating frags of partition $part\n" );
-  if ( my $ret = system "sort -m -z -o $c{target}{data}/$part-sorted $c{target}{data}/parts/$part/*"){
-    $c{lg}->( 0, "Sort returned ".($ret>>8).", REVERTING partition $part\n");
+  if ( my $ret = system "sort -m -k1,1 -o $c{target}{data}/$part-sorted $c{target}{data}/parts/$part/*"){
+    $c{lg}->( 0, "Sort returned ".($ret>>8).", REVERTING part $part\n");
     statshift( free => reduce => $part );
-    next;
+    return;
   }
-  $c{lg}->( 0, "done concatenating frags of partition $part\n" );
+  $c{lg}->( 0, "done concatenating frags of part $part\n" );
   @frags = ("$c{target}{data}/$part-sorted");
-  my $mid_rs = exists $conf{rs} ? "TTRS='$conf{rs}'" : '';
-  my $cat = "$mid_rs $c{target}{data}/client/bin/rmnulls $c{target}{data}/$part-sorted";
+  my $cat = "$c{target}{data}/client/bin/rmnulls $c{target}{data}/$part-sorted";
   my $pipe = new FileHandle
     "cd $conf{context}/$conf{proj}; $cat | $conf{reducecmd} 2>$err |";
 
@@ -363,7 +363,7 @@ sub reduce {
   unlink @frags;
   register_errchunk( $err, $part ); # do this before master can exit
   my $rstat = register( out => [], reduce => $part );
-  $c{lg}->( 0, "distributed reduction $part, to $count out chunks, retired with status ".$rstat->code."\n");
+  $c{lg}->( 0, "distributed part $part, to $count out chunks, retired with status ".$rstat->code."\n");
 }
 
 
@@ -479,8 +479,9 @@ sub assemble_fragments {
   my ( $dir, $part, $hosts ) = @_;
   my @hosts = @$hosts;
   my $ihosts = fyshuffle( $part, scalar @hosts );
+  mkdir "$dir/$part" unless -d "$dir/$part";
   for my $i (@$ihosts) {
-    system "$scp -q $hosts[$i]:$dir/$part/* $dir/$part/. 2>/dev/null";
+    system "$scp $hosts[$i]:$dir/$part/* $dir/$part/. 2>/dev/null";
   }
   my @parts = map { (m|([^/]+)$|) } glob("$dir/$part/*");
   return @parts;

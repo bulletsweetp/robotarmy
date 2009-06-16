@@ -78,8 +78,8 @@ The RobotArmy: map and mapreduce operations on distributed corpora.
 \section{SYNOPSIS\label{SYNOPSIS}\index{SYNOPSIS}}
 \begin{verbatim}
   On the commandline:
-  # tt map inputcorpus map-command outputcorpus
-  # tt mapreduce inputcorpus map-command reduce-command outputcorpus
+  # robots map inputcorpus map-command outputcorpus
+  # robots mapreduce inputcorpus map-command reduce-command outputcorpus
 \end{verbatim}
 
 \section{DESCRIPTION\label{DESCRIPTION}\index{DESCRIPTION}}
@@ -206,10 +206,10 @@ The RobotArmy package essentially does this, only across multiple machines. In f
 
 
 
-We can use the \textbf{tt mapreduce} program with a distributed corpus called \textbf{odyssey}, like so:
+We can use the \textbf{robots mapreduce} program with a distributed corpus called \textbf{odyssey}, like so:
 
 \begin{verbatim}
- # tt mapreduce odyssey wc.m wc.r odyssey_wc
+ # robots mapreduce odyssey wc.m wc.r odyssey_wc
 \end{verbatim}
 
 
@@ -222,7 +222,7 @@ There will appear a new distributed corpus called odyssey\_wc, containing record
 \section{Using RobotArmy\label{Using_RobotArmy}\index{Using RobotArmy}}
 
 
-You can use the \textbf{tt mapreduce} or \textbf{tt map} commands to launch map and mapreduce operations, or the \textbf{ct} program to execute any command on every host in the pool. Type "ct help" for a list of all the options.
+You can use the \textbf{robots mapreduce} or \textbf{robots map} commands to launch map and mapreduce operations, or the \textbf{ct} program to execute any command on every host in the pool. Type "ct help" for a list of all the options.
 
 
 
@@ -240,7 +240,7 @@ After all the setup has been done, there should be sufficient information in the
 Normally only the last three are specified on the command line, while the rest are in the config files. Hence the typical call looks like this:
 
 \begin{verbatim}
-  # tt mapreduce odyssey wc.m wc.r odyssey_wc
+  # robots mapreduce odyssey wc.m wc.r odyssey_wc
 \end{verbatim}
 
 
@@ -263,7 +263,7 @@ Some more useful built-in commands are:
 
 
 
-\textbf{ct reseat corpus localcorpus -cluster=master} - places a corpus in a local dir on the master. Use only on a result corpus that can actually fit on the master.
+\textbf{ct copy corpus localcorpus -cluster=master} - places a corpus in a local dir on the master. Use only on a result corpus that can actually fit on the master.
 
 \section{Requirements\label{Requirements}\index{Requirements}}
 \begin{description}
