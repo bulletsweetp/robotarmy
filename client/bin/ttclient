@@ -86,7 +86,7 @@ sub init {
   my %target       = %{ corpus( $conf{target} ) };
   my @crew         = @{ readlist("clusters/$conf{crew}/.hosts") };
   my $context      = "$conf{context}/$conf{proj}";
-  my $localcontext = ( $conf{master} eq $thishost ) ? $conf{proj} : $context;
+  my $localcontext = $context;
 
   my %priority = ( 
     killl   => 1,
@@ -109,7 +109,7 @@ sub init {
     delete $priority{justmap};
     delete $priority{mappart};
     delete $priority{reduce};
-    my $localcontext = $conf{proj};
+    $localcontext = $conf{proj};
   }
 
   my %c = (
@@ -122,7 +122,6 @@ sub init {
     localcontext => $localcontext,
     lg           => logger("$thishost($cpu)"),
     mapper       => $conf{mapcmd},
-    partitioner  => ( $conf{partition} || 'partition' ),
     localfiles   => (exists $source{data} ? [ map { (m|([^/]+)$|) } glob("$source{data}/*") ] : []),
     source       => \%source,
     target       => \%target,
@@ -458,7 +457,7 @@ sub lockone {
   }
   my @free = object_count($type, 0);
   while(@free){
-    my $obj = shift @free;
+    my $obj = splice(@free, int rand(@free), 1);
     next unless statshift('lock' => $type => $obj->[0])->is_success;
     return $obj;
   }

@@ -69,6 +69,7 @@ my @commands = qw{ help list rollcall init
                    copy add delete empty 
                    repair rename append cat 
                    head tail slice check df
+                   scan push
                    cmd map mapreduce sync exec }; 
 die usage() unless $command
             and ( grep { $command eq $_ } @commands );
@@ -82,7 +83,7 @@ if( grep { $command eq $_ } qw{ map mapreduce exec }){
 } else {
   $args[0] = corpus($args[0]) 
     if @args # predetermine specifics of a corpus
-    and not grep { $command eq $_ } qw{ help sync cmd rollcall df }; # except for these
+    and not grep { $command eq $_ } qw{ help sync cmd rollcall df push }; # except for these
   $command = "ct$command";
   $command = \&$command;
   $command->(@args);
@@ -286,17 +287,19 @@ sub ctrollcall {
     $hosts{$_} = 1 for @$h;
   }
 
-  print STDERR "Gathering keys for ", scalar keys %hosts, " hosts...";
   my $tmpfile = "/tmp/robotarmy-hosts-" . int(rand(2**31)) . int(rand(2**32)) . ".txt";
   open TMP, ">$tmpfile";
   print TMP join( "\n", keys %hosts ), "\n";
   close TMP;
 
+  print STDERR "Gathering keys for ", scalar keys %hosts, " hosts...\n";
+  print STDERR "Verbose mode: printing host keys to STDOUT...\n" if exists $OPTS{verbose};
   my @found = `cat $tmpfile | ssh-keyscan -t rsa -f - 2>/dev/null`;
+  print @found if exists $OPTS{verbose};
   my %found = map { chomp; s/\s.*$//; $_ => 1 } @found;
   my @missing = grep { !exists $found{$_} } keys %hosts;
-  print "Found ", scalar @found, " hosts out of ", scalar keys %hosts, "\n";
-  print "Missing:\n", join("\n", @missing), "\n" if @missing;
+  print STDERR "Found ", scalar @found, " hosts out of ", scalar keys %hosts, "\n";
+  print STDERR "Missing:\n", join("\n", @missing), "\n" if @missing;
   unlink $tmpfile;
 }
 
@@ -375,8 +378,8 @@ sub ctdelete {
   for my $corp (@rest){
     my %conf = %{ corpus($corp) };
     next unless corpusexists(\%conf);
-    ctcmd($conf{ring}, "rm -r $conf{repos}/$conf{nodename}");
-    ctcmd($conf{crew}, "rm -r $conf{repos}/$conf{nodename}") if exists $conf{crew};
+    ctcmd($conf{ring}, "rm -r $conf{repos}/$conf{nodename} 2>/dev/null");
+    ctcmd($conf{crew}, "rm -r $conf{repos}/$conf{nodename} 2>/dev/null") if exists $conf{crew};
 
     # delete any shadows
     my $name = "clusters/$conf{ring}/$conf{name}";
@@ -668,22 +671,45 @@ sub inventory {
 # convenient diskfree
 sub ctdf {
   my($ring) = @_;
+  unless(defined $ring){
+    my %conf = readconf('conf/ct.conf');
+    $ring = $conf{ring};
+  }
   my $h = readlist("clusters/$ring/.hosts");
   my @lines;
+  my @headers = qw( Host Total Used Available Usage Mountpoint );
+  my ($total, $used, $avail) = (0,0,0);
+  my @entries = ();
   for my $host ( @$h ){
-    my @line = `$ssh $host df -m`;
-    push @lines, $line[1];
-    print $line[1];
-  }
-  my ($total, $used, $avail) = (0,0);
-  for (@lines){
-    my @fields = split /\s+/;
+    my @line = `$ssh $host df -B 1G repos/`;
+    @line = ('', ' 0 0 0 - -') unless @line;
+    my @fields = split /\s+/, $line[1];
     $total += $fields[1];
     $used  += $fields[2];
     $avail += $fields[3];
+    $fields[0] = $host;
+    push @entries, \@fields;
   }
-  print "\n$ring:\nMB Total[$total] Used[$used] Available[$avail]\n";
+  my $pct = int($used/$total*100);
+  print formatlist(\@headers, \@entries), "\n\n";
+  print "(GB) total [$total], used [$used], avail [$avail], usage [$pct%], ring [$ring]\n";
 }
+
+
+# push files/dirs to worker machines
+sub ctpush {
+  my ($ring, $source, $target) = @_;
+  die "No destination path" unless defined $target;
+  die "No such ring $ring" unless -e "clusters/$ring/.hosts";
+
+  my $hosts = readlist("clusters/$ring/.hosts");
+  for ( @$hosts ){
+    print "$_:\n";
+    my $retval = system "scp -o 'ConnectTimeout 1' -r $OPTS{proj}/$source $_:$target";
+    print "scp return value ", ($retval>>8), ".\n" if $retval;
+  }
+}
+
 
 
 
@@ -1307,7 +1333,8 @@ Corpus control commands:
     
       help [command]          (print this usage list [or usage details for "command")
       list [corpus]           (list of all corpora [or detail of "corpus"])
-      rollcall [cluster]      (inventories all hosts systemwide or of a specific cluster)
+      rollcall [cluster] {-verbose}  (inventory all hosts systemwide, optionally 
+                                      printing host keys)
       init "corpus" {options} (create empty corpus, with options overriding defaults)
       add "corpus" ["source"] (add "source" - a file, files, or a dir - to 
                                     the corpus, treating each file as one record.
@@ -1385,7 +1412,32 @@ Examples:
   robots list homer/odyssey
 LIST
 ,
-    rollcall => '',
+    rollcall => <<ROLLCALL
+Usage: robots rollcall
+
+  Inventory all hosts known to the master. This will print the names of any
+  missing hosts. When called with the -verbose option, prints out the host
+  keys in the openssh "known_hosts" file format, making it convenient to 
+  refresh the .ssh/ directory when adding new machines.
+
+Examples:
+  robots rollcall
+  robots rollcall -verbose >> new_known_hosts
+ROLLCALL
+,
+    push => <<PUSH
+Usage: robots push "ring" localname remotename
+
+  Copy a local file OR directory "localname" out to all hosts in "ring".
+  This passes arguments to scp repeatedly, so to use wildcards in the
+  local files or dir, you must quote them as in the example below.
+
+Examples:
+  robots push twain-root /etc/hosts /etc/hosts
+  robots push twain new_known_hosts .ssh/known_hosts
+  robots push twain 'worker_dotssh/*' .ssh/.
+PUSH
+,
     init => <<INIT
 Usage: robots init "corpus" {options}
 
