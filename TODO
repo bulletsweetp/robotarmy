@@ -32,8 +32,6 @@ Bugs:
 
 - shadow corpora on exec op are invisible
 
-- deletion of corpus does not delete all shadow corpora if crew != rings
-
 - reimplement configuration to use .robotsrc, conf/robotsrc (and cmdline opts) rather than cont/ct.conf, conf/tt.conf. Goal is to have single config file, which will require renaming some things. For instance, record separator options for input/output.
 
 - prove the completeness of operations (new reduce phase not yet proven)
@@ -48,8 +46,6 @@ Features:
 - preaggregation option in transitive mapreduce operation
 
 - For job control, record the user program's pid somewhere so killl interventions can take immediate effect by terminating long-lived executions.
-
-- roll scan.pl and push.pl into bin/robots
 
 - configurable compression schemes [gzip,lzo,lzma] for kv records and flat txt chunks.
 
