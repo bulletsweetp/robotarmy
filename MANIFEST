@@ -34,5 +34,3 @@ t/CT.t
 t/TT.t
 t/texts/odyssey.txt.gz
 t/texts/iliad.txt.gz
-push.pl
-scan.pl
