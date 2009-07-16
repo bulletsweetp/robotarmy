@@ -17,6 +17,7 @@ programs/remove_keys.r
 programs/no_op.r
 status/bin/env
 status/bin/ttstatus
+status/bin/graphs
 status/htdocs/crossdomain.xml
 status/keys/.exists
 client/bin/partition

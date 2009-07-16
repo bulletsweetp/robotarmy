@@ -892,7 +892,7 @@ sub startservices {
     die "status server failed to start: exit code $exit, sig $sig\n";
   }
   my $master = $mr{master}; $master =~ s/^.+?\@//;
-  print STDERR "started status service: http://$master:$mr{statusport}/ttstatus\n";
+  print STDERR "started status service: http://$master:$mr{statusport}/graphs\n";
 
   # clean up on INT or DIE
   $SIG{INT} = $SIG{__DIE__} = sub { kill TERM => `cat $mr{sandbox}/httpd.pid`; exit 1; };
@@ -928,6 +928,17 @@ fastcgi.server = (
                 "socket"       => "$mr{sandbox}/ttstatus.socket",
                 "check-local"  => "disable",
                 "bin-path"     => "$mr{sandbox}/bin/ttstatus",
+                "min-procs"    => 1,
+                "max-procs"    => 1,
+                "max-load-per-proc" => 1,
+                "idle-timeout" => 10,
+            )),
+         "/graphs" => 
+            ((
+                "socket"       => "$mr{sandbox}/graphs.socket",
+                "check-local"  => "disable",
+                "bin-path"     => "$mr{sandbox}/bin/graphs",
+                "bin-environment" => ("SANDBOX" => "$mr{sandbox}"),
                 "min-procs"    => 1,
                 "max-procs"    => 1,
                 "max-load-per-proc" => 1,

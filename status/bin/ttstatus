@@ -104,7 +104,7 @@ sub browserprint {
 # TYPE  : string
 # ID    : string
 # STATE : enum of FREE, LOKD, RTRD
-# BASIS : list
+# BASIS : string
 
 # STATE COUNT TABLE
 # $c{TYPE}->[FREE,LOKD,RTRD,OOPS]
@@ -118,17 +118,24 @@ use constant LOKD => 1;
 use constant RTRD => 2;
 use constant OOPS => 3;
 
+use constant MAXLISTLEN => 10;
+
 {
-  my %o = ();
-  my %c = ();
+
+  my %o = ();  # full object records
+  my %c = ();  # object count cache
 
   sub listify {
-    my ( $type, $state ) = @_;
+    my ( $type, $state, $maxrecords ) = @_;
     return undef unless exists $o{$type};
     my @records = ();
     for my $k ( keys %{$o{$type}} ){
-      push @records, [ $k, @{ $o{$type}->{$k}->[BASIS] } ]
-        if $o{$type}->{$k}->[STATE] == $state;
+      if( $o{$type}->{$k}->[STATE] == $state ){
+        $record = $k;
+		$record .= ',' . $o{$type}->{$k}->[BASIS] if $o{$type}->{$k}->[BASIS];
+        push @records, $record;
+      }
+      last if ($maxrecords > 0) and (@records >= $maxrecords);
     }
     return \@records;
   }
@@ -139,7 +146,7 @@ use constant OOPS => 3;
       return undef unless exists $c{$type};
       return @{ $c{$type} };
     } else {
-      return map { [ $_, @{$c{$_}} ] } keys %c;
+      return map { join(',', $_, @{$c{$_}} ) } keys %c;
     }
   }
 
@@ -154,7 +161,10 @@ use constant OOPS => 3;
         $c{$type}->[FREE]++;
 		#print STDERR "created new record $item :: $type (@old)\n";
       }
-      push @{ $o{$type}->{$item}->[BASIS] }, @old;
+	  if(@old){
+        $o{$type}->{$item}->[BASIS] .= ',' if $o{$type}->{$item}->[BASIS];
+        $o{$type}->{$item}->[BASIS] .= join(',', @old);
+      }
     }
     1;
   }
@@ -182,10 +192,12 @@ use constant OOPS => 3;
 
 # get all 'inventory' records, or all of a certain type, or a single record
 sub GET {
+  my $query = $_[0];
   my (undef, $type, $state) = split(m|/|, $ENV{PATH_INFO});
   my $basis;
   if(defined $type and defined $state){
-    $basis = listify($type, $state);
+    my $recs = exists $query->{count} ? $query->{count} : MAXLISTLEN;
+    $basis = listify($type, $state, $recs);
 	#print STDERR "TTSTATUS returning ", scalar @$basis, " basis items for type $type, state $state\n";
   } elsif ($type){
     $basis = [ count($type) ];

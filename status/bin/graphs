@@ -1,0 +1,269 @@
+#!/usr/bin/perl
+
+#    graphs - the status service object grapher for The Robot Army 
+#
+#    Copyright (C) 2009 H5 Technologies, Ira Woodhead
+#    
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#  
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+########################################################
+############# cgi setup preliminaries ##################
+########################################################
+
+my $dot = `which dot`; chomp $dot;
+my $uninitialized = 1;
+
+my $HOME    = $ENV{HOME};
+my $SANDBOX = $ENV{SANDBOX};
+chdir $SANDBOX;
+require "client/lib/shared.pl";
+
+use LWP::UserAgent;
+
+use FCGI;
+use IO::Handle;
+use CGI qw(:standard); # convenience functions
+use HTTP::Status;
+
+use Data::Dumper;
+$Data::Dumper::Useqq = 1;
+
+use JSON;
+$JSON::SingleQuote = 1;
+
+my %formats = (
+  perl => sub { my $obj = Dumper $_[0]; substr($obj,0,7) = ''; return $obj; },
+  json => sub { objToJson( $_[0], {pretty => 1, indent => 4} ) },
+  browser => \&browserprint,
+);
+
+sub init {
+  my $port = $ENV{SERVER_PORT};
+  setsvc( LWP::UserAgent->new, "http://127.0.0.1:$port/ttstatus" );
+  $uninitialized = 0;
+}
+
+my $request = FCGI::Request;
+while ( $request->Accept >= 0 ) {
+
+  $uninitialized && init();
+  my $method = $ENV{REQUEST_METHOD};
+
+  if ( grep { $_ eq $method } qw( GET ) ) {
+    my $handler = \&$method;
+    my %query = map { split /=/ } split /;/, lc $ENV{QUERY_STRING};
+    $ENV{MESSAGE_BODY} .= $_ while <STDIN>;
+    my( $status, $obj ) = $handler->(\%query);
+    return_result(  $status, $obj );
+  } else {
+    return_result( RC_NOT_IMPLEMENTED );
+  }
+}
+
+sub return_result {
+  my ( $status, $obj ) = @_;
+  my $status_msg = join " ", $status, status_message($status);
+
+  if ( is_error($status) or !defined $obj ) {
+    print header( -status => $status_msg );
+    return;
+  }
+
+  my %query = map { split /=/ } split /;/, lc $ENV{QUERY_STRING};
+  my $formatter = $formats{perl};
+  $formatter = $formats{ $query{format} }
+        if (exists $query{format}
+        and exists $formats{ $query{format} });
+
+  print header( -status => $status_msg );
+  
+  print ref $obj ? $formatter->($obj) : $obj;
+  return;
+}
+
+
+# Format the data structure for browser viewing. This is an incredibly
+# stupid prettyprint. It simply places an html break at all newlines.
+sub browserprint {
+  my $obj = shift;
+  my $dumped = Dumper $obj;
+  substr($dumped, 0, 7) = '';
+  $dumped =~ s/\n/<br>\n/g;
+  return start_html("Pretty-printed Data Structure") . $dumped . end_html;
+}
+
+
+
+
+########################################################
+############# actual status service code ###############
+########################################################
+
+# OBJECT TABLE
+# $o{TYPE}->{ID}->[STATE,BASIS]
+# TYPE  : string
+# ID    : string
+# STATE : enum of FREE, LOKD, RTRD
+# BASIS : string
+
+# STATE COUNT TABLE
+# $c{TYPE}->[FREE,LOKD,RTRD,OOPS]
+
+use constant STATE => 0;
+use constant BASIS => 1;
+
+# states
+use constant FREE => 0;
+use constant LOKD => 1;
+use constant RTRD => 2;
+use constant OOPS => 3;
+
+use constant MAXLISTLEN => 100;
+
+#{
+#
+#  my %o = ();  # full object records
+#  my %c = ();  # object count cache
+#
+#  sub listify {
+#    my ( $type, $state, $maxrecords ) = @_;
+#    return undef unless exists $o{$type};
+#    my @records = ();
+#    for my $k ( keys %{$o{$type}} ){
+#      if( $o{$type}->{$k}->[STATE] == $state ){
+#        $record = $k;
+#		$record .= ',' . $o{$type}->{$k}->[BASIS] if $o{$type}->{$k}->[BASIS];
+#        push @records, $record;
+#      }
+#      last if @records >= $maxrecords;
+#    }
+#    return \@records;
+#  }
+#
+#  sub count {
+#    my $type = shift;
+#	if(defined $type){
+#      return undef unless exists $c{$type};
+#      return @{ $c{$type} };
+#    } else {
+#      return map { join(',', $_, @{$c{$_}} ) } keys %c;
+#    }
+#  }
+#
+#  sub create {
+#    my($type, $list, @old) = @_;
+#    unless( exists $o{$type} ){
+#      @{ $c{$type} } = (0,0,0,0);
+#    }
+#    for my $item (@$list){
+#	  unless( exists $o{$type}->{$item} ){
+#        $o{$type}->{$item}->[STATE] = FREE;
+#        $c{$type}->[FREE]++;
+#		#print STDERR "created new record $item :: $type (@old)\n";
+#      }
+#	  if(@old){
+#        $o{$type}->{$item}->[BASIS] .= ',' if $o{$type}->{$item}->[BASIS];
+#        $o{$type}->{$item}->[BASIS] .= join(',', @old);
+#      }
+#    }
+#    1;
+#  }
+#
+#  sub set_state {
+#    my($type, $id, $from, $to) = @_;
+#	return undef unless exists $o{$type}
+#                    and exists $o{$type}->{$id}
+#                           and $o{$type}->{$id}->[STATE] == $from;
+#
+#    #print STDERR "changing $type :: $id state from $from to $to\n";
+#    $o{$type}->{$id}->[STATE] = $to;
+#    $c{$type}->[$from]--;
+#    $c{$type}->[$to]++;
+#	$c{$type}->[OOPS]++ if $to == FREE; # freeing an obj irreversibly increments the oops
+#	1;
+#  }
+#
+#}
+
+
+
+sub overview {
+  my @list = object_count('');
+  my $uri ="http://$ENV{HTTP_HOST}";
+
+  for my $table (@list){
+    my ($type, @counts) = split /,/, $table;
+    my $turl = "$uri/graphs/$type";
+	my @urls = ("<a href='$turl'>$type</a>");
+    for my $state ( FREE, LOKD, RTRD ){
+      push @urls, "<a href='$uri/ttstatus/$type/$state'>$counts[$state]</a>";
+    }
+	$table = join(",", @urls) . ",$counts[3]";
+  }
+  return join "</br>\n", @list;
+}
+
+sub graphify {
+  my ($type, $max) = @_;
+  my ($free, $lokd, $rtrd, $oops) = object_count($type);
+  return "" unless ($free or $lokd or $rtrd);
+
+  my @color = qw( green red black );
+  my $graph = "digraph $type {\n";
+  for my $state ( FREE, LOKD, RTRD ){
+    $graph .= "subgraph cluster_$state {\n node [color=$color[$state]];\n";
+    my @items = object_count($type, $state);
+    for my $item (@items){
+      s/:.+$//   for @$item;
+      s/^.+?\@// for @$item; 
+      my $from = shift @$item; $from = '"' . $from . '"';
+      my $to = @$item ? ' -> { "' . join('" "', @$item) . '" }' : '';
+      $graph .= "$from $to ;\n";
+    }
+    $graph .= "}\n";
+  }
+  $graph .= "}\n";
+ 
+  open DOT, "|HOME=$HOME $dot -Tpng -o $SANDBOX/$type.png 2>$SANDBOX/$type.dot.err" 
+    or die "Can't open dot: $!\n";
+  print DOT $graph; close DOT;
+
+  #print STDERR "Created $SANDBOX/$type.png from:\n\n$graph\n";
+  return "<img src=http://$ENV{HTTP_HOST}/$type.png>";
+}
+
+
+# 
+sub GET {
+  my $query = $_[0];
+  my (undef, $type) = split(m|/|, $ENV{PATH_INFO});
+  my $basis;
+  if(defined $type){
+    my $recs = exists $query->{count} ? $query->{count} : MAXLISTLEN;
+    $basis = graphify($type, $recs);
+  } else {
+    $basis = overview();
+  }
+
+  return RC_OK, $basis if defined $basis;
+  return RC_NOT_FOUND;
+}
+
+
+
+
+
+

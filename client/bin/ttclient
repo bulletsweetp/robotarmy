@@ -167,7 +167,7 @@ sub target {
   return unless @$host;
   $host = $host->[0];
   my $ret = system( "ssh $host 'mkdir -p $c{target}{data}'");
-  $c{lg}->(0, "created target repository on $host with retval ".($ret>>8)."\n");
+  $c{lg}->(0, "created target repository on $host with retval ".($ret>>8).", signal ".($ret&127)."\n");
   register( nothing => [], target => $host ) unless $ret; # leave locked if any problem
 }
 
@@ -185,9 +185,13 @@ sub crew {
   $ret = system "$scp -r ../client $host\:$c{target}{data}/client";
   $c{lg}->(0, "$host sandbox copy failed; ssh returned " .($ret>>8). ". CREW INSTALL FAILED.\n") && return if $ret;
 
+  $ret = system "$ssh $host 'rm -f $c{target}{data}/client/log/* $c{target}{data}/client/err/*'";
+  $c{lg}->(0, "$host sandbox log clear returned " .($ret>>8). " (WARNING: logs may be truncated)\n") if $ret;
+
   $ret = system "$rsync $c{localcontext}/ $host\:$c{context}";
-  $c{lg}->(0, "$host exec context rsync failed; ssh returned " .($ret>>8). ". CREW INSTALL FAILED.\n") && return if $ret;
+  $c{lg}->(0, "$host exec context rsync failed; rsync returned " .($ret>>8). ". CREW INSTALL FAILED.\n") && return if $ret;
  
+  $c{lg}->(0, "installed infrastructure and exec context on $host\n");
   my @processes = map { "$host:$_" } (1..$c{maps});
   register( launch => \@processes, crew => $host ); # register-and-retire
   launch(%c); # bump a launch just for speedy propagation
@@ -209,7 +213,7 @@ sub launch {
     sleep 5;
     statshift( free => launch => $process->[0] );
   } else {
-    register( nothing => [], launch => $process->[0] );
+    register( launcher => [ $c{thishost} ], launch => $process->[0] );
   }
 }
 
@@ -301,7 +305,7 @@ sub universalmap {
 
   my $ret = system $pipe;
   if ($ret) {
-    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ". (Error, REVERTING $tabletype)\n" );
+    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ", signal ".($ret&127).". (Error, REVERTING $tabletype)\n" );
     statshift( free => $tabletype => $name );
     unlink "foreign/$name" if -e "foreign/$name";
     unlink "$id-mapped"    if -e "$id-mapped";

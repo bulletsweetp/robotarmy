@@ -104,8 +104,9 @@ sub vnode_index {
 
   sub object_count {
     my ( $type, $state ) = @_;
-    my $uri = "$url/$type";
-    $uri .= "/$state" if defined $state;
+    my $uri = "$url" . 
+      (defined $type  ? "/$type"  : '') . 
+      (defined $state ? "/$state" : '');
     my $log = logger("object count on $type");
     my $request = HTTP::Request->new( GET => $uri );
     my $ref;
@@ -124,7 +125,15 @@ sub vnode_index {
         die; 
       }
     }
-    return @$ref;
+
+	if(defined $state or !defined $type){
+      for (@$ref){
+        my @items = split /,/;
+        $_ = \@items;
+      }
+    }
+
+	return @$ref;
   }
 
   sub statshift {

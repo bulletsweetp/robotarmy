@@ -22,6 +22,10 @@ Things on the roadmap. You can help out with any of these.
 
 Bugs:
 
+- Since viral infrastructure installs, partial logs from the originating host get copied along with the rest of the sandbox. This causes cat of [log] shadow corpora to be incomplete when a truncated log is the one chosen in the stream view.
+
+- make ttstatus more cpu efficient, it gets pegged during reduces by repeatedly having to serialize *long* lists. This is causing slowdown no doubt about it.
+
 - no space left on device should be handled more smoothly
 
 - add at least one test for exec op in t/TT.t
@@ -39,13 +43,27 @@ Bugs:
 
 Features:
 
+- Job control 
+  o kill jobs virally
+  o add / subtract processes
+  o record the user program's pid somewhere to facilitate this
+
 - A quick diagnostic task to speedily verify which robots are ready via exec op possibly
+  o Note: some important files that should be checked (possibly via cksum)
+   ~/.ssh/known_hosts
+   ~/.ssh/id_rsa.pub
+   ~/.ssh/authorized_keys
+   ~/.ssh/ oh hell just everything here
+   /etc/make.conf <- for the GENTOO_MIRRORS and SYNC entries
+   /etc/hosts
+   /etc/fstab
+  o ALSO: important libraries should be checked, like Compress::LZO and Text::Scan.
+    - note perl's compilation failed return code is 2.
+
 
 - A "reversion map" visual display of chunks vs machines indicating possible causes (data or environment) of reversions.
 
 - preaggregation option in transitive mapreduce operation
-
-- For job control, record the user program's pid somewhere so killl interventions can take immediate effect by terminating long-lived executions.
 
 - configurable compression schemes [gzip,lzo,lzma] for kv records and flat txt chunks.
 
