@@ -802,15 +802,15 @@ sub ttmap {
   my $log = logger($mr{cmd});
 
   # prepare the status service by registering tasks and corresponding tables of objects
-  my @tasks = qw( justmapsrc target crew launch killl justmap );
+  my @tasks = qw( inventory target install start killl justmap );
   my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
   die "No hosts in crew $mr{crew}" unless @crew;
   my @registers = (
-    [ justmapsrc  => $source{hosts} ],
-    [ target      => $target{hosts} ],
-    [ justmap     => $source{files} ],
-    [ crew        => \@crew         ],
-    [ task        => \@tasks        ],
+    [ source => $source{hosts} ],
+    [ target => $target{hosts} ],
+    [ in     => $source{files} ],
+    [ crew   => \@crew         ],
+    [ task   => \@tasks        ],
   );
 
   for my $tab (@registers){
@@ -854,15 +854,15 @@ sub ttmapreduce {
   my $log = logger($mr{cmd});
 
   # prepare the status service by registering tasks and corresponding tables of objects
-  my @tasks = qw( mappartsrc target crew launch killl mappart reduce );
+  my @tasks = qw( inventory target install start killl mappart reduce );
   my @crew =  @{ readlist("clusters/$mr{crew}/.hosts") };
   die "No hosts in crew $mr{crew}" unless @crew;
   my @registers = (
-    [ mappartsrc  => $source{hosts} ],
-    [ target      => $target{hosts} ],
-    [ mappart     => $source{files} ],
-    [ crew        => \@crew         ],
-    [ task        => \@tasks        ],
+    [ source => $source{hosts} ],
+    [ target => $target{hosts} ],
+    [ in     => $source{files} ],
+    [ crew   => \@crew         ],
+    [ task   => \@tasks        ],
   );
 
   for my $tab (@registers){
@@ -974,20 +974,20 @@ sub mapreducemonitor {
   my $log = logger("$mr{cmd} monitor");
   clientlogshadow($mr{crew}, $mr{target}, $mr{maps});
 
-  my @kickdata = ( kicker('mappart', $mr{statusport},  5*60),
-                   kicker('reduce',  $mr{statusport}, 20*60) );
+  my @kickdata = ( kicker(in   => $mr{statusport},  5*60),
+                   kicker(part => $mr{statusport}, 20*60) );
 
   my $ret = system "cd $mr{sandbox}/client; perl bin/ttclient $mr{master} 1";
   $log->(0, "launched master client in sandbox with code $ret\n");
 
   my @funcs = ();
-  push @funcs, kicker('mappartsrc', $mr{statusport}, 5*60);
+  push @funcs, kicker(source => $mr{statusport}, 5*60);
   push @funcs, chopper(@kickdata);
-  push @funcs, input_checkpointer('mappart', $mr{source}, $mr{target}, $mr{statusport});
-  push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
+  push @funcs, input_checkpointer(in => $mr{source}, $mr{target}, $mr{statusport});
+  push @funcs, stderr_recorder(         $mr{crew},   $mr{target}, $mr{statusport});
 
   my $recordout = 
-    output_recorder($mr{target}, 'reduce', $mr{statusport});
+    output_recorder($mr{target}, 'part', $mr{statusport});
   monitorloop($log, $recordout, @funcs);
 }
 
@@ -1002,13 +1002,13 @@ sub mapmonitor {
   $log->(0, "launched master client in sandbox with code $ret\n");
 
   my @funcs = ();
-  push @funcs, kicker('justmapsrc', $mr{statusport}, 5*60);
-  push @funcs, kicker('justmap',    $mr{statusport}, 5*60);
-  push @funcs, input_checkpointer('justmap', $mr{source}, $mr{target}, $mr{statusport});
-  push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
+  push @funcs, kicker(source => $mr{statusport}, 5*60);
+  push @funcs, kicker(in     => $mr{statusport}, 5*60);
+  push @funcs, input_checkpointer(in => $mr{source}, $mr{target}, $mr{statusport});
+  push @funcs, stderr_recorder(         $mr{crew},   $mr{target}, $mr{statusport});
 
   my $recordout = 
-    output_recorder($mr{target}, 'justmap', $mr{statusport});
+    output_recorder($mr{target}, 'in', $mr{statusport});
   monitorloop($log, $recordout, @funcs);
 }
 
@@ -1026,7 +1026,7 @@ sub execmonitor {
   push @funcs, stderr_recorder(   $mr{crew},   $mr{target}, $mr{statusport});
 
   my $recordout = 
-    output_recorder($mr{target}, 'execute', $mr{statusport});
+    output_recorder($mr{target}, 'launch', $mr{statusport});
   monitorloop($log, $recordout, @funcs);
 }
 
@@ -1083,81 +1083,7 @@ sub clientlogshadow {
   close CLOG;
 }
 
-#sub inventorying {
-#  my($conf) = @_;
-#  my %conf = %$conf;
-#  my $log = logger('inventory');
-#  my %source = %{ corpus($conf{source}) };
-#  my %chunks = map { $_=> 1 } @{ $source{files} };
-#
-#  return sub {
-#    my ($free, $locked) = object_count('source');
-#    return 0 unless $free or $locked; # all accounted for
-#    return 1 unless $free;
-#    my @free = object_count('source', 0); # 0 means 'FREE'
-#    while(@free){
-#      my $hostobj = shift @free;
-#      my $host = $hostobj->[0];
-#      $log->(0, "locking $host for registration.\n");
-#      statshift('lock' => source => $host );
-#      my @files = grep { chunksignature($_) } 
-#                  `$ssh $host 'ls $source{repos}/$source{nodename} 2>/dev/null | cat'`;
-#      unless( @files ){
-#        statshift(free => source => $host );
-#        $log->(0, "$host had no files... keeping an eye on it.\n");
-#        next;
-#      }
-#      chomp @files;
-#      @files = grep { exists $chunks{$_} } @files;
-#      $log->(0, "registering " . scalar @files . " files from $host\n");
-#      register(in => \@files, source => $host);
-#    }
-#    return 1;
-#  };
-#}
 
-
-## install the environment and launch commands once per monkey. Keep checking
-## if any are unavailable at first.
-#sub installerlauncher {
-#  my($conf)   = @_;
-#  my %task    = %$conf;
-#  my $log     = logger('installer-launcher');
-#  my %trg     = %{ corpus($task{target}) };
-#  my @ring = @{ readlist("clusters/$task{ring}/.hosts") };
-#  my @crew    = @{ readlist("clusters/$task{crew}/.hosts") };
-#  my %crew = map { $crew[$_] => $_ } 0..$#crew;
-#
-#  system "$ssh $_ 'mkdir -p $trg{repos}/$trg{nodename}'" for @ring; # sloppy
-#
-#  return sub {
-#    for my $host (@crew){
-#      my $ret = system 
-#        "$ssh $host 'rm -rf $trg{repos}/$trg{nodename}/client; mkdir -p $trg{repos}/$trg{nodename}; mkdir -p $task{context}/$task{proj}'";
-#      $log->(0, "$host unresponsive, ssh returned " .($ret>>8). " - did not install.\n") && next if $ret;
-#      
-#      $ret = system 
-#        "$scp -r $task{sandbox}/client $host\:$trg{repos}/$trg{nodename}/client";
-#      $log->(0, "installed on $host with exit code " . ($ret>>8) . ".\n");
-#    
-#      $ret = system
-#        "$rsync $task{proj}/ $host\:$task{context}/$task{proj}";
-#      $log->(0, "mirrored exec context on $host with exit code " . ($ret>>8) . ".\n");
-#    }
-#
-#    for my $host (@crew){
-#      my $i = $crew{$host};
-#      my $cmds = join ';', map {"perl bin/ttclient $i $_"} 1..$task{maps};
-#      my $ret = system "$ssh $host \'cd $trg{repos}/$trg{nodename}/client;$cmds\'";
-#      $log->(0, "launched on $host with exit code " .($ret>>8). ".\n");
-#      delete $crew{$host} unless $ret; # remove from future consideration if successful
-#    }
-#    return 0 unless %crew; # everybody finished?
-#    @crew = keys %crew;
-#    return 1;
-#  };
-#}
-#
 # KICKER - produces a code ref that monitors objects of a certain type, 
 # finishing only when all have been retired. Unlocks any locked ones 
 # hanging around for more than $time seconds

@@ -33,6 +33,10 @@ use HTTP::Request;
 use POSIX 'setsid';
 require 'lib/shared.pl';
 
+# dispatch table constants for init()
+use constant INPUT    => 0;
+use constant PRIORITY => 1;
+
 my $scp = 'scp -q -o "ConnectTimeout 1"';
 my $ssh = 'ssh -q -o "ConnectTimeout 1"';
 my $rsync = 'rsync -a';
@@ -52,17 +56,19 @@ exit;
 
 sub mainloop {
   my %c = @_;
-  $c{lg}->(0, "starting with allowed tasks ". join(",",keys %{$c{priority}})."\n");
+  $c{lg}->(0, "starting with allowed tasks ". join(",",keys %{$c{dispatch}})."\n");
   while(1){
     my @tasks = freelist('task');
     last unless @tasks;
     @tasks = map { $_->[0] } @tasks;
-    @tasks = grep { exists $c{priority}{$_} } @tasks;
-    @tasks = sort { $c{priority}{$b} <=> $c{priority}{$a} } @tasks;
+    @tasks = grep { exists $c{dispatch}{$_} } @tasks;
+    @tasks = sort { $c{dispatch}{$b}->[PRIORITY] <=> 
+                    $c{dispatch}{$a}->[PRIORITY] 
+                  } @tasks;
     my $task = '';
     while (@tasks){
       my $t = shift @tasks;
-      my($free) = object_count($t);
+      my($free) = object_count($c{dispatch}{$t}->[INPUT]);
       next unless $free;
       $task = $t;
     }
@@ -88,32 +94,32 @@ sub init {
   my $context      = "$conf{context}/$conf{proj}";
   my $localcontext = $context;
 
-  my %priority = ( 
-    killl   => 1,
-    launch  => 1,
-    crew    => 2,
-    target  => 3,
-    justmapsrc => 3,
-    mappartsrc => 3,
-    execute => 4,
-    justmap => 4,
-    mappart => 4, 
-    reduce  => 4, 
+  # funcname => [ input => priority ]
+  my %dispatch = (
+    killl     => [ 'die'  => 1 ],
+    start     => [ launch => 1 ],
+    install   => [ crew   => 2 ],
+    target    => [ target => 3 ],
+    inventory => [ source => 3 ],
+    execute   => [ launch => 4 ],
+    justmap   => [ in     => 4 ],
+    mappart   => [ in     => 4 ],
+    reduce    => [ part   => 4 ],
   );
 
   # if this is the master host:
   # - just help with the infrastructure but don't execute any user code
   # - execution context is the original, so don't prefix it with a context repos
   if($conf{master} eq $thishost){
-    delete $priority{execute};
-    delete $priority{justmap};
-    delete $priority{mappart};
-    delete $priority{reduce};
+    delete $dispatch{execute};
+    delete $dispatch{justmap};
+    delete $dispatch{mappart};
+    delete $dispatch{reduce};
     $localcontext = $conf{proj};
   }
 
   my %c = (
-    priority     => \%priority,
+    dispatch     => \%dispatch,
     crew         => \@crew,
     maps         => $conf{maps},
     thishost     => $thishost,
@@ -138,18 +144,9 @@ sub init {
 
 
 
-# inventory input data for a host
-sub justmapsrc {
-  inventory(justmapsrc => justmap => @_);
-}
-
-sub mappartsrc {
-  inventory(mappartsrc => mappart => @_);
-}
-
 sub inventory {
-  my ($from, $to, %c) = @_;
-  my $host = lockone($from, []);
+  my %c = @_;
+  my $host = lockone(source => []);
   return unless @$host;
   $host = $host->[0];
   my $files = inventory_host($host, $c{source}{data});
@@ -157,25 +154,25 @@ sub inventory {
   my %found = map {$_=>1} @$files;
   my @files = grep { exists $found{$_} } @{ $c{source}{files} };
   $c{lg}->(0, "registering " . scalar @files . " files from $host\n");		      
-  register($to => \@files, $from => $host);
+  register(in => \@files, source => $host);
 }
 
 # prepare output area on a host
 sub target {
   my %c = @_;
-  my $host = lockone('target', []);
+  my $host = lockone(target => []);
   return unless @$host;
   $host = $host->[0];
   my $ret = system( "ssh $host 'mkdir -p $c{target}{data}'");
   $c{lg}->(0, "created target repository on $host with retval ".($ret>>8).", signal ".($ret&127)."\n");
-  register( nothing => [], target => $host ) unless $ret; # leave locked if any problem
+  register( targeter => [ $c{thishost} ], target => $host ) unless $ret; # retire targeted host. leave locked if any problem.
 }
 
 # install execution context and client infrastructure,
 # then register launches for the installed host
-sub crew {
+sub install {
   my %c = @_;
-  my $host = lockone('crew', []);
+  my $host = lockone(crew => []);
   return unless @$host;
   $host = $host->[0];
   my $ret = system
@@ -194,13 +191,13 @@ sub crew {
   $c{lg}->(0, "installed infrastructure and exec context on $host\n");
   my @processes = map { "$host:$_" } (1..$c{maps});
   register( launch => \@processes, crew => $host ); # register-and-retire
-  launch(%c); # bump a launch just for speedy propagation
+  start(%c); # bump a launch just for speedy propagation
 }
 
 # launch client on the specified host/context
-sub launch {
+sub start {
   my %c = @_;
-  my $process = lockone('launch', []);
+  my $process = lockone(launch => []);
   unless (@$process){
     $c{lg}->(0, "failed to lock one for launch\n");
     return;
@@ -220,19 +217,19 @@ sub launch {
 # kill user operation on the specified host
 sub killl {
   my %c = @_;
-  my $process = lockone('killl', []);
+  my $process = lockone('die' => []);
   return unless @$process;
   my($host, $pid) = split /:/, $process->[0];
   my $ret = system "$ssh $host \'cd $c{target}{data}/client; kill `cat ttclient-$pid.pid`\'";
   $c{lg}->(0, "killed $host : $pid process with exit code " .($ret>>8). ".\n");
-  register( nothing => [], killl => $process->[0] ) unless $ret;
-  statshift( free => killl => $process->[0] ) if $ret;
+  register( killer => [ $c{thishost} ], 'die' => $process->[0] ) unless $ret;
+  statshift( free => 'die' => $process->[0] ) if $ret;
 }
 
 
 ## map and partition
 sub mappart {
-  my ($id, $name) = universalmap('mappart', @_);
+  my ($id, $name) = universalmap(@_);
   return unless $id;
 
   # partition mapped file
@@ -246,7 +243,7 @@ sub mappart {
   # register partitions / retire input chunk	
   my @parts = map { (m|/(\d+)/[^/]+$|) } glob("$c{target}{data}/parts/*/$name");
   $c{lg}->( 0, "map'd $id to " . scalar @parts . " parts\n" );
-  register( reduce => \@parts, mappart => $name );
+  register( part => \@parts, in => $name );
   $c{lg}->( 0, "finished mappart task.\n" );
 #  unlink "$id-mapped";
 
@@ -257,7 +254,7 @@ sub mappart {
 
 # map without partitioning
 sub justmap {
-  my ($id, $name) = universalmap('justmap', @_);
+  my ($id, $name) = universalmap(@_);
   my %c = @_;
   unless($id){
     $c{lg}->(0, "justmap failed, returning\n");
@@ -267,17 +264,17 @@ sub justmap {
   # seat mapped file / retire input chunk
   my $chunks = seat( $c{target}, $id, FileHandle->new("<$id-mapped"), $c{thishost} );
   $c{lg}->( 0, "map'd $id to $chunks output chunks\n" );
-  register( 'out' => [], justmap => $name );
+  register( mapper => [ $c{thishost} ], in => $name );
   $c{lg}->( 0, "finished justmap task.\n" );
   unlink "$id-mapped";
 }
 
 
 sub universalmap {
-  my ($tabletype, %c) = @_;
-  my $chunk = lockone( $tabletype, $c{localfiles} );
+  my %c = @_;
+  my $chunk = lockone( in => $c{localfiles} );
   unless(@$chunk){
-    $c{lg}->(0, "lockone($tabletype) failed to return anything useful, universalmap returning undef\n");
+    $c{lg}->(0, "lockone 'in' failed to return anything useful, universalmap returning undef\n");
     return undef;
   }
   my ( $name, @locations ) = @$chunk;
@@ -289,8 +286,8 @@ sub universalmap {
   unless ( -e $file ) {
     retrieve_foreign( $file, @locations );
     unless (-e "foreign/$name"){
-      $c{lg}->(0, "retrieve_foreign() on $name failed, REVERTING $tabletype\n");
-      statshift( free => $tabletype => $name );
+      $c{lg}->(0, "retrieve_foreign() on $name failed, REVERTING in\n");
+      statshift( free => in => $name );
       sleep int rand(5);
 	  return undef;
     }
@@ -305,8 +302,8 @@ sub universalmap {
 
   my $ret = system $pipe;
   if ($ret) {
-    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ", signal ".($ret&127).". (Error, REVERTING $tabletype)\n" );
-    statshift( free => $tabletype => $name );
+    $c{lg}->( 0, "mapped $name with retval " .($ret>>8). ", signal ".($ret&127).". (Error, REVERTING 'in' entry)\n" );
+    statshift( free => in => $name );
     unlink "foreign/$name" if -e "foreign/$name";
     unlink "$id-mapped"    if -e "$id-mapped";
     return undef;
@@ -319,9 +316,9 @@ sub universalmap {
 # If so, unlock the reduce table.
 sub bump_reduce_table {
   my $log = shift;
-  my($free,$locked) = object_count('mappart');
+  my($free,$locked) = object_count('in');
   unless($free+$locked){
-    $log->(0, "no unfinished 'mappart', time to unlock reduce table\n");
+    $log->(0, "no unfinished 'in' entries, time to unlock reduce task\n");
     my $ret = statshift( free => task => 'reduce' )->is_success;
     $log->(0, "unlock of reduce task returned $ret\n");
   }
@@ -332,7 +329,7 @@ sub bump_reduce_table {
 # result files.
 sub reduce {
   my %c = @_;
-  my $partobj = lockone( 'reduce', [] );
+  my $partobj = lockone( part => [] );
   return unless @$partobj;
   my ( $part, @sources ) = @$partobj;
   $c{lg}->( 0, "locked partition $part\n" );
@@ -344,8 +341,8 @@ sub reduce {
   my ( $missing, $extra ) = compare_sets( \@sources, \@frags );
   if (@$missing) {
     $c{lg}->( 0, scalar @$missing . " fragments missing from part $part (expected ". scalar(@sources) ."). REVERTING.\n");
-    statshift( free => reduce => $part );
-    statshift( free => mappart => $_ ) for @$missing;
+    statshift( free => part => $part );
+    statshift( free => in   => $_ ) for @$missing; # status svc should do this automatically...?
     return 0;    # reexecute the map phase
   }
 
@@ -353,7 +350,7 @@ sub reduce {
   $c{lg}->( 0, "begin concatenating frags of partition $part\n" );
   if ( my $ret = system "sort -m -k1,1 -o $c{target}{data}/$part-sorted $c{target}{data}/parts/$part/*"){
     $c{lg}->( 0, "Sort returned ".($ret>>8).", REVERTING part $part\n");
-    statshift( free => reduce => $part );
+    statshift( free => part => $part );
     return;
   }
   $c{lg}->( 0, "done concatenating frags of part $part\n" );
@@ -365,7 +362,7 @@ sub reduce {
   my $count = seat( $c{target}, $part, $pipe, $c{thishost} );
   unlink @frags;
   register_errchunk( $err, $part ); # do this before master can exit
-  my $rstat = register( out => [], reduce => $part );
+  my $rstat = register( out => [], part => $part );
   $c{lg}->( 0, "distributed part $part, to $count out chunks, retired with status ".$rstat->code."\n");
 }
 
@@ -376,7 +373,7 @@ sub execute {
   my $env = "TTRS='$c{target}{rs}' TTHOST=$c{thishost}";
   my $id  = md5_hex( $c{thishost} );
   my $err = "$c{target}{data}/client/err/$id";
-  unless( statshift( 'lock' => execute => $c{thishost} )->is_success){
+  unless( statshift( 'lock' => launch => $c{thishost} )->is_success){
     $c{lg}->( 0, "self lock failed on $c{thishost} (me)\n" );
     sleep int rand(5);
     return;
@@ -388,7 +385,7 @@ sub execute {
 
   my $pipe   = FileHandle->new("cd $c{context}; $env $c{mapper} 2>$err |");
   my $chunks = seat( $c{target}, $id, $pipe, $c{thishost} );
-  register( 'out' => [], execute => $c{thishost} );
+  register( 'out' => [], launch => $c{thishost} );
   $c{lg}->( 0, "exec finished seating $chunks chunks.\n" );
 
   register_errchunk( $err, $id );
