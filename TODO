@@ -22,9 +22,10 @@ Things on the roadmap. You can help out with any of these.
 
 Bugs:
 
-- Since viral infrastructure installs, partial logs from the originating host get copied along with the rest of the sandbox. This causes cat of [log] shadow corpora to be incomplete when a truncated log is the one chosen in the stream view.
 
-- make ttstatus more cpu efficient, it gets pegged during reduces by repeatedly having to serialize *long* lists. This is causing slowdown no doubt about it.
+- output corpora have zero length chunks sometimes. When such a corpus is used as input, the operation never terminates because such chunks do not exist in the repository, jus
+ 
+- when source and target rings are different from the crew, robots gets confused about where the output corpus is.
 
 - no space left on device should be handled more smoothly
 
@@ -58,7 +59,7 @@ Features:
    /etc/hosts
    /etc/fstab
   o ALSO: important libraries should be checked, like Compress::LZO and Text::Scan.
-    - note perl's compilation failed return code is 2.
+    - note perl's "compilation failed" return code is 2.
 
 
 - A "reversion map" visual display of chunks vs machines indicating possible causes (data or environment) of reversions.
