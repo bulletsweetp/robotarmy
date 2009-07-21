@@ -257,12 +257,15 @@ sub justmap {
   my ($id, $name) = universalmap(@_);
   my %c = @_;
   unless($id){
-    $c{lg}->(0, "justmap failed, returning\n");
+    $c{lg}->(0, "universalmap failed, returning\n");
     return;
   }
 
   # seat mapped file / retire input chunk
-  my $chunks = seat( $c{target}, $id, FileHandle->new("<$id-mapped"), $c{thishost} );
+  my $chunks = 0;
+  if(-s "$id-mapped"){
+    $chunks = seat( $c{target}, $id, FileHandle->new("<$id-mapped"), $c{thishost} );
+  }
   $c{lg}->( 0, "map'd $id to $chunks output chunks\n" );
   register( mapper => [ $c{thishost} ], in => $name );
   $c{lg}->( 0, "finished justmap task.\n" );
