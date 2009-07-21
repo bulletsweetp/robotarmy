@@ -1,7 +1,7 @@
 
 # corpus defaults
 
-repos		/home/tt/repos
+repos		/home/bot/repos
 chunksize	32M
 format		txt
 replicate	3

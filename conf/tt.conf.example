@@ -2,7 +2,7 @@
 # tt operations config file
 
 # mirrored execution contexts go here
-context	/home/tt/context
+context	/home/bot/context
 
 
 loglevel	0
@@ -17,7 +17,7 @@ rs			"\n"
 maps		1
 
 # lighttpd executable
-httpd	/usr/local/sbin/lighttpd
+httpd	/usr/sbin/lighttpd
 
 # cluster to use for executing the programs, as opposed to holding the data
 #crew	stepford
