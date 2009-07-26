@@ -69,7 +69,7 @@ my @commands = qw{ help list rollcall init
                    copy add delete empty 
                    repair rename append cat 
                    head tail slice check df
-                   scan push
+                   push
                    cmd map mapreduce sync exec }; 
 die usage() unless $command
             and ( grep { $command eq $_ } @commands );
@@ -1220,8 +1220,8 @@ sub input_checkpointer {
     $count = $current;
 
     $log->(0, "recording $current '$srctype' objects in $conf{name}\n");
-    my @free = object_count($srctype, 0); # 0 == FREE
-    my @lokd = object_count($srctype, 1); # 1 == LOKD
+    my @free = object_count($srctype, 0, 0); # 0 == FREE
+    my @lokd = object_count($srctype, 1, 0); # 1 == LOKD
     @{$conf{files}} = map { $_->[0] } @free, @lokd;
     writecorpus(\%conf);
     return 1;

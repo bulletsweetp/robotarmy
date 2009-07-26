@@ -103,10 +103,11 @@ sub vnode_index {
   }
 
   sub object_count {
-    my ( $type, $state ) = @_;
+    my ( $type, $state, $count ) = @_;
     my $uri = "$url" . 
       (defined $type  ? "/$type"  : '') . 
-      (defined $state ? "/$state" : '');
+      (defined $state ? "/$state" : '') .
+      (defined $count ? "?count=$count" : '');
     my $log = logger("object count on $type");
     my $request = HTTP::Request->new( GET => $uri );
     my $ref;
@@ -126,6 +127,7 @@ sub vnode_index {
       }
     }
 
+    # translate serialized bases to lists
 	if(defined $state or !defined $type){
       for (@$ref){
         my @items = split /,/;
