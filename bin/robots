@@ -1092,9 +1092,16 @@ sub kicker {
   my $log = logger("$type kicker");
   my $start = time;
   my ($free, $lokd, $rtrd, $oops) = (0,0,0,0);
+  my $mma = 1;
+  my $lastrtrd = 0;
 
   my $rate = sub {
-    return sprintf "%.2f/sec", $rtrd / (time - $start + 1);
+    my $r = ($rtrd - $lastrtrd) / (time - $start + 1);
+    $mma = (19*$mma+$r)/20;
+    my $eta = ($free+$lokd)/$mma;
+    $start = time;
+    $lastrtrd = $rtrd;
+    return sprintf "%.2f/sec, eta %d secs", $r, int $eta;
   };
 
   # monitor the locked / unlocked input chunks while there are any
@@ -1114,7 +1121,7 @@ sub kicker {
       return 0;    
     }
     my $now = time;
-    my @lokd = object_count($type, 1); # 1 is 'LOKD'
+    my @lokd = object_count($type, 1, 0); # 1 is 'LOKD'
     my %latest = map { $_ => $now } @lokd;
     for my $stillhere (grep { exists $latest{$_} } keys %times){
       $latest{$stillhere} = $times{$stillhere};
@@ -1146,7 +1153,7 @@ sub output_recorder {
     my ($free, $lokd) = object_count('out');
     if(defined($free) and $free){
       $log->(0, "found out:[$free,$lokd] in $target{name}\n");
-      my @free = object_count('out', 0); # 0 == FREE
+      my @free = object_count('out', 0, 0); # 0 == FREE
       open RESULT, ">>clusters/$target{ring}/$target{name}.files" or die $!;
       for (@free){
         my $chunk = $_->[0];
@@ -1183,7 +1190,7 @@ sub stderr_recorder {
     my ($free) = object_count('err');
     $log->(0, "found $free free 'err' objects\n") if defined $free;
     return 1 unless $free;
-    my @free = object_count('err', 0); # 0 == FREE
+    my @free = object_count('err', 0, 0); # 0 == FREE
     open RESULT, ">>clusters/$conf{ring}/$conf{name}.files" or die $!;
     for (@free){
       my $chunk = $_->[0];
