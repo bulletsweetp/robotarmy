@@ -213,7 +213,7 @@ sub ctlist {
     listclusters();
   }
   s|^clusters/|| for @corpora;
-  my @headers = qw{ ring corpus format zip records bytes chunks rs };
+  my @headers = qw{ ring corpus format zip records bytes chunks node rs };
   my @entries = ();
   for my $path (@corpora){
     my ($ring, $corpus) = split m|/|, $path;
@@ -221,7 +221,8 @@ sub ctlist {
     my ($chunks, $records, $bytes) = chunkmeta(%$conf);
     push @entries, [ $ring, $corpus, $conf->{format}, 
                      (exists $conf->{uncompress}?'':'*'), 
-                     $records, $bytes, $chunks, $conf->{rs} ];
+                     $records, $bytes, $chunks, 
+                     substr($conf->{nodename},0,5) . '..', $conf->{rs} ];
   }
   print "\n", scalar @corpora, " corpora:\n";
   print formatlist(\@headers, \@entries), "\n";
