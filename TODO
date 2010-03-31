@@ -23,8 +23,6 @@ Things on the roadmap. You can help out with any of these.
 Bugs:
 
 
-- output corpora have zero length chunks sometimes. When such a corpus is used as input, the operation never terminates because such chunks do not exist in the repository, jus
- 
 - when source and target rings are different from the crew, robots gets confused about where the output corpus is.
 
 - no space left on device should be handled more smoothly
@@ -43,6 +41,10 @@ Bugs:
 
 
 Features:
+
+- some mechanism or redesign such that corpus handles are backed up and a corpus can be traced from an individual machine's repository (no more orphans -- in effect dangling inodes). Solves problems of :
+  o Master disk fail
+  o unreferenced repositories from failed connections during delete
 
 - Job control 
   o kill jobs virally
