@@ -1280,6 +1280,7 @@ Corpus control commands:
       list [corpus]           (list of all corpora [or detail of "corpus"])
       rollcall [cluster] {-verbose}  (inventory all hosts systemwide, optionally 
                                       printing host keys)
+      push "cluster" (file|dir) (place file or directory in all robots' home dir)
       init "corpus" {options} (create empty corpus, with options overriding defaults)
       add "corpus" ["source"] (add "source" - a file, files, or a dir - to 
                                     the corpus, treating each file as one record.
